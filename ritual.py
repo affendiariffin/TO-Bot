@@ -13,7 +13,7 @@ Contains:
   • run_ritual_8    — entry point for Teams 8s NTL ritual  (ritual_8s.py)
   • RollOffView
   • /round begin-ritual command
-  • /roll command (standalone dice roller)
+  • /roll command (standalone D6 roller)
 """
 import discord
 from discord import app_commands, ui
@@ -28,6 +28,7 @@ from database import *
 from services import ac_active_events
 from commands_teams import ensure_pairing_room_thread  # thread helper lives there
 from ritual_8s import run_ritual_8  # Teams 8s NTL ritual
+
 
 def _layout_mission_pickers(slot: int, fmt: str, layout_winner: str) -> tuple:
     other = "team_b" if layout_winner == "team_a" else "team_a"
@@ -722,32 +723,13 @@ async def round_begin_ritual(interaction: discord.Interaction, event_id: str):
         f"Pairing Room: {pr_thread.mention if pr_thread else '#event-noticeboard'}",
         ephemeral=True,
     )
-@app_commands.describe(dice="Dice notation e.g. 1d6, 2d6, 1d20 (default: 1d6)")
-async def roll_dice(interaction: discord.Interaction, dice: str = "1d6"):
-    try:
-        parts = dice.lower().strip().split("d")
-        count = int(parts[0]) if parts[0] else 1
-        sides = int(parts[1])
-        if not (1 <= count <= 10 and sides in (4, 6, 8, 10, 12, 20, 100)):
-            raise ValueError
-    except (ValueError, IndexError):
-        await interaction.response.send_message(
-            "❌ Invalid dice notation. Use `1d6`, `2d6`, `1d20` etc. "
-            "Supported sides: 4, 6, 8, 10, 12, 20, 100.", ephemeral=True
-        )
-        return
 
-    rolls = [_random.randint(1, sides) for _ in range(count)]
-    total = sum(rolls)
-    roll_str = " + ".join(f"**{r}**" for r in rolls)
-    result = f"🎲 {interaction.user.display_name} rolled `{dice}`: {roll_str}"
-    if count > 1:
-        result += f" = **{total}**"
-    await interaction.response.send_message(result)
 
-# ══════════════════════════════════════════════════════════════════════════════
-# RUN
-# ══════════════════════════════════════════════════════════════════════════════
+# ── /roll ─────────────────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
-    bot.run(TOKEN)
+@tree.command(name="roll", description="Roll a D6", guild=GUILD)
+async def roll_dice(interaction: discord.Interaction):
+    result = _random.randint(1, 6)
+    await interaction.response.send_message(
+        f"🎲 {interaction.user.display_name} rolled a **{result}**!"
+    )
