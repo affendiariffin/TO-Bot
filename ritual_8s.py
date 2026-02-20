@@ -33,6 +33,19 @@ then updating the RollOffView dispatch:
 
 ──────────────────────────────────────────────────────────
 """
+import discord
+from discord import ui
+import asyncio
+
+from config import (COLOUR_GOLD, COLOUR_AMBER, TOURNAMENT_MISSIONS, fe)
+from state import FMT
+from database import (
+    db_get_event, db_get_team, db_get_team_members,
+    db_get_team_round, db_update_team_round,
+    db_get_pairing_state, db_update_pairing_state,
+    db_create_team_pairing, db_get_team_pairings, db_update_team_pairing,
+)
+
 
 # ── 8s Layout table ─────────────────────────────────────────────────────────
 # All 8 layout slots for an 8-player event, in order.
