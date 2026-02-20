@@ -15,76 +15,108 @@ Registration commands (/reg group):
   • /reg drop
   • /reg list
 
-Registered into the bot in main.py via bot.add_listener / tree.add_command.
+Command groups are registered in main.py via tree.add_command().
+Call init(bot_instance) from main.py's on_ready to wire up the bot reference.
 """
 import discord
 from discord import app_commands
+import asyncio
+import math
 import uuid
-from datetime import datetime, timezone
-from config import (GUILD_ID, GUILD, EVENT_NOTICEBOARD_ID, COLOUR_GOLD,
-                    COLOUR_CRIMSON, WARHAMMER_ARMIES)
+from datetime import datetime, timedelta, timezone
+from typing import Dict
+from config import (GUILD_ID, GUILD, EVENT_NOTICEBOARD_ID, WHATS_PLAYING_ID,
+                    COLOUR_GOLD, COLOUR_CRIMSON, COLOUR_AMBER, COLOUR_SLATE,
+                    WARHAMMER_ARMIES, TOURNAMENT_MISSIONS, fe, faction_colour)
 from state import ES, RS, FMT, is_to
 from database import *
 from threads import (ensure_submissions_thread, ensure_lists_thread,
-                     add_player_to_event_threads)
+                     add_player_to_event_threads, calculate_rounds)
 from embeds import (build_event_announcement_embed, build_list_review_header,
-                    build_player_list_embed)
+                    build_player_list_embed, build_spectator_dashboard_embed)
 from views import EventAnnouncementView, RegistrationApprovalView
 from services import (refresh_spectator_dashboard, ac_active_events,
                       ac_all_events, ac_missions, ac_armies, ac_detachments,
                       ac_pending_regs, log_immediate)
 
+# ── Bot reference (set via init()) ───────────────────────────────────────────
+bot = None
+
+def init(bot_instance):
+    """Called from main.py after bot is created to wire up the bot reference."""
+    global bot
+    bot = bot_instance
+
 # ══════════════════════════════════════════════════════════════════════════════
 # SLASH COMMANDS  —  EVENT MANAGEMENT  (TO only)
 # ══════════════════════════════════════════════════════════════════════════════
 
-event_grp = app_commands.Group(name="event", description="Tournament event management",
-                                guild_ids=[GUILD_ID],
-                                default_permissions=discord.Permissions(use_application_commands=True))
+event_grp = app_commands.Group(
+    name="event",
+    description="Tournament event management",
+    guild_ids=[GUILD_ID],
+    default_permissions=discord.Permissions(use_application_commands=True),
+)
 
 @event_grp.command(name="create", description="Create a new TTS tournament event")
 @app_commands.describe(
-    name="Event name", mission="Mission code", points_limit="Points limit (e.g. 2000)",
-    start_date="Start date DD/MM/YYYY", end_date="End date DD/MM/YYYY (same for 1 day)",
-    max_players="Player cap (default 16)", rounds_per_day="Rounds per day (default 3)",
-    terrain_layout="Optional terrain notes",
-    format="Format: singles (default), 2v2, teams_3, teams_5, teams_8",
+    name="Event name",
+    mission="Mission code",
+    points_limit="Points limit (e.g. 2000)",
+    max_players="Maximum number of players",
+    start_date="Start date (YYYY-MM-DD)",
+    end_date="End date (YYYY-MM-DD)",
+    rounds_per_day="Rounds per day",
+    terrain_layout="Optional terrain layout notes",
+    format="Event format",
 )
 @app_commands.autocomplete(mission=ac_missions)
 @app_commands.choices(format=[
-    app_commands.Choice(name="Singles (default)", value="singles"),
-    app_commands.Choice(name="2v2 (1000pts each)",  value="2v2"),
-    app_commands.Choice(name="Teams 3s (2000pts each)", value="teams_3"),
-    app_commands.Choice(name="Teams 5s (2000pts each)", value="teams_5"),
-    app_commands.Choice(name="Teams 8s — NTL ritual (2000pts each)", value="teams_8"),
+    app_commands.Choice(name="Singles",   value="singles"),
+    app_commands.Choice(name="2v2",       value="2v2"),
+    app_commands.Choice(name="Teams 3s",  value="teams_3"),
+    app_commands.Choice(name="Teams 5s",  value="teams_5"),
+    app_commands.Choice(name="Teams 8s",  value="teams_8"),
 ])
-async def event_create(interaction: discord.Interaction,
-                        name: str, mission: str, points_limit: int,
-                        start_date: str, end_date: str,
-                        max_players: int = 16, rounds_per_day: int = 3,
-                        terrain_layout: str = None,
-                        format: str = "singles"):
+async def event_create(
+    interaction: discord.Interaction,
+    name: str,
+    mission: str,
+    points_limit: int,
+    max_players: int,
+    start_date: str,
+    end_date: str,
+    rounds_per_day: int = 3,
+    terrain_layout: str = "",
+    format: str = "singles",
+):
+    if not is_to(interaction):
+        await interaction.response.send_message("❌ TO only.", ephemeral=True); return
     await interaction.response.defer(ephemeral=True)
+
     try:
-        sd = datetime.strptime(start_date, "%d/%m/%Y").date()
-        ed = datetime.strptime(end_date,   "%d/%m/%Y").date()
+        sd = datetime.strptime(start_date, "%Y-%m-%d").date()
+        ed = datetime.strptime(end_date,   "%Y-%m-%d").date()
     except ValueError:
-        await interaction.followup.send("❌ Date format must be DD/MM/YYYY", ephemeral=True); return
+        await interaction.followup.send("❌ Date format must be YYYY-MM-DD.", ephemeral=True); return
+
     if mission not in TOURNAMENT_MISSIONS:
         await interaction.followup.send("❌ Invalid mission code.", ephemeral=True); return
 
-    team_sz   = FMT.team_size(format)
-    ind_pts   = FMT.individual_points(format)
+    team_sz  = FMT.team_size(format)
+    ind_pts  = FMT.individual_points(format)
 
-    eid = db_create_event({"name": name, "mission_code": mission, "points_limit": points_limit,
-                            "start_date": sd, "end_date": ed, "max_players": max_players,
-                            "rounds_per_day": rounds_per_day, "terrain_layout": terrain_layout,
-                            "created_by": str(interaction.user.id)})
+    eid = db_create_event({
+        "name": name, "mission_code": mission, "points_limit": points_limit,
+        "start_date": sd, "end_date": ed, "max_players": max_players,
+        "rounds_per_day": rounds_per_day, "terrain_layout": terrain_layout,
+        "created_by": str(interaction.user.id),
+    })
     db_update_event(eid, {"format": format, "team_size": team_sz, "individual_points": ind_pts})
 
-    event  = db_get_event(eid)
-    embed  = build_event_announcement_embed(event)
-    view   = EventAnnouncementView(eid)
+    event = db_get_event(eid)
+    embed = build_event_announcement_embed(event)
+    view  = EventAnnouncementView(eid)
 
     ch = interaction.guild.get_channel(EVENT_NOTICEBOARD_ID)
     if ch:
@@ -97,12 +129,17 @@ async def event_create(interaction: discord.Interaction,
     try:
         start_dt = datetime.combine(sd, datetime.min.time()).replace(hour=9, tzinfo=timezone.utc)
         m = TOURNAMENT_MISSIONS[mission]
-        fmt_label = {"singles":"Singles","2v2":"2v2","teams_3":"Teams 3s","teams_5":"Teams 5s","teams_8":"Teams 8s"}.get(format,"Singles")
+        fmt_label = {
+            "singles": "Singles", "2v2": "2v2",
+            "teams_3": "Teams 3s", "teams_5": "Teams 5s", "teams_8": "Teams 8s",
+        }.get(format, "Singles")
         disc_evt = await interaction.guild.create_scheduled_event(
             name=name,
-            description=(f"⚔️ Warhammer 40k TTS Tournament — {ind_pts}pts  [{fmt_label}]\n"
-                         f"🗺️ {m['name']} [{m['deployment']}]\n"
-                         f"Register interest in #event-noticeboard"),
+            description=(
+                f"⚔️ Warhammer 40k TTS Tournament — {ind_pts}pts  [{fmt_label}]\n"
+                f"🗺️ {m['name']} [{m['deployment']}]\n"
+                f"Register interest in #event-noticeboard"
+            ),
             start_time=start_dt,
             end_time=start_dt + timedelta(hours=8),
             entity_type=discord.EntityType.external,
@@ -113,35 +150,50 @@ async def event_create(interaction: discord.Interaction,
     except Exception as e:
         print(f"⚠️ Discord event creation failed: {e}")
 
-    fmt_label = {"singles":"Singles","2v2":"2v2","teams_3":"Teams 3s","teams_5":"Teams 5s","teams_8":"Teams 8s"}.get(format,"Singles")
+    fmt_label = {
+        "singles": "Singles", "2v2": "2v2",
+        "teams_3": "Teams 3s", "teams_5": "Teams 5s", "teams_8": "Teams 8s",
+    }.get(format, "Singles")
     await interaction.followup.send(
         f"✅ **{name}** created — `{eid}`\n"
         f"Format: **{fmt_label}** · {ind_pts}pts per player\n"
         f"{calculate_rounds(max_players)} rounds suggested  ·  Announcement posted to #event-noticeboard",
-        ephemeral=True)
-    await log_immediate(bot, "Event Created",
+        ephemeral=True,
+    )
+    await log_immediate(
+        interaction.client,
+        "Event Created",
         f"🏆 **{name}** by {interaction.user.display_name}\n"
         f"Format: {fmt_label} · Mission {mission}: {TOURNAMENT_MISSIONS[mission]['name']} · {ind_pts}pts · {sd}→{ed}",
-        COLOUR_GOLD)
+        COLOUR_GOLD,
+    )
 
 @event_grp.command(name="open-interest", description="Open interest registration")
 @app_commands.autocomplete(event_id=ac_active_events)
 async def event_open_interest(interaction: discord.Interaction, event_id: str):
+    if not is_to(interaction):
+        await interaction.response.send_message("❌ TO only.", ephemeral=True); return
     event = db_get_event(event_id)
-    if not event: await interaction.response.send_message("❌ Not found.", ephemeral=True); return
+    if not event:
+        await interaction.response.send_message("❌ Not found.", ephemeral=True); return
     db_update_event(event_id, {"state": ES.INTEREST})
     ch = interaction.guild.get_channel(EVENT_NOTICEBOARD_ID)
     if ch:
-        await ch.send(f"📣 **Interest registration open for {event['name']}!**\n"
-                      f"Click **Register Interest** on the event card above.")
+        await ch.send(
+            f"📣 **Interest registration open for {event['name']}!**\n"
+            f"Click **Register Interest** on the event card above."
+        )
     await interaction.response.send_message("✅ Interest phase opened.", ephemeral=True)
 
 @event_grp.command(name="open-registration", description="Open full list registration")
 @app_commands.autocomplete(event_id=ac_active_events)
 async def event_open_registration(interaction: discord.Interaction, event_id: str):
+    if not is_to(interaction):
+        await interaction.response.send_message("❌ TO only.", ephemeral=True); return
     await interaction.response.defer(ephemeral=True)
     event = db_get_event(event_id)
-    if not event: await interaction.followup.send("❌ Not found.", ephemeral=True); return
+    if not event:
+        await interaction.followup.send("❌ Not found.", ephemeral=True); return
     db_update_event(event_id, {"state": ES.REGISTRATION})
     regs = db_get_registrations(event_id, RS.INTERESTED)
     ch   = interaction.guild.get_channel(EVENT_NOTICEBOARD_ID)
@@ -156,13 +208,15 @@ async def event_open_registration(interaction: discord.Interaction, event_id: st
 @event_grp.command(name="lock-lists", description="Lock lists and publish list review dashboard")
 @app_commands.autocomplete(event_id=ac_active_events)
 async def event_lock_lists(interaction: discord.Interaction, event_id: str):
+    if not is_to(interaction):
+        await interaction.response.send_message("❌ TO only.", ephemeral=True); return
     await interaction.response.defer(ephemeral=True)
     event = db_get_event(event_id)
-    if not event: await interaction.followup.send("❌ Not found.", ephemeral=True); return
+    if not event:
+        await interaction.followup.send("❌ Not found.", ephemeral=True); return
     regs = db_get_registrations(event_id, RS.APPROVED)
 
-    # Create/get private lists thread
-    lists_thread = await ensure_lists_thread(bot, event_id, interaction.guild, event["name"])
+    lists_thread = await ensure_lists_thread(interaction.client, event_id, interaction.guild, event["name"])
     target = lists_thread or interaction.guild.get_channel(EVENT_NOTICEBOARD_ID)
 
     if target:
@@ -171,7 +225,6 @@ async def event_lock_lists(interaction: discord.Interaction, event_id: str):
             await target.send(embed=build_player_list_embed(reg, i))
             await asyncio.sleep(0.4)
 
-    # Also post a brief notice in the main noticeboard channel
     ch = interaction.guild.get_channel(EVENT_NOTICEBOARD_ID)
     if ch and lists_thread:
         await ch.send(
@@ -182,20 +235,27 @@ async def event_lock_lists(interaction: discord.Interaction, event_id: str):
     # DM approved players
     for reg in regs:
         try:
-            user = await bot.fetch_user(int(reg["player_id"]))
+            user = await interaction.client.fetch_user(int(reg["player_id"]))
             await user.send(
                 f"📋 **Army lists published for {event['name']}!**\n"
                 f"Check the Army Lists thread in #event-noticeboard to review your opponents."
             )
         except: pass
-    await interaction.followup.send(f"✅ {len(regs)} lists published to {lists_thread.mention if lists_thread else '#event-noticeboard'}.", ephemeral=True)
+
+    await interaction.followup.send(
+        f"✅ {len(regs)} lists published to {lists_thread.mention if lists_thread else '#event-noticeboard'}.",
+        ephemeral=True,
+    )
 
 @event_grp.command(name="start", description="Start the event and post spectator dashboard")
 @app_commands.autocomplete(event_id=ac_active_events)
 async def event_start(interaction: discord.Interaction, event_id: str):
+    if not is_to(interaction):
+        await interaction.response.send_message("❌ TO only.", ephemeral=True); return
     await interaction.response.defer(ephemeral=True)
     event = db_get_event(event_id)
-    if not event: await interaction.followup.send("❌ Not found.", ephemeral=True); return
+    if not event:
+        await interaction.followup.send("❌ Not found.", ephemeral=True); return
     db_update_event(event_id, {"state": ES.IN_PROGRESS})
     wpc = interaction.guild.get_channel(WHATS_PLAYING_ID)
     if wpc:
@@ -205,25 +265,26 @@ async def event_start(interaction: discord.Interaction, event_id: str):
         except: pass
         db_update_event(event_id, {"spectator_msg_id": str(msg.id)})
 
-    # Create private submissions thread
-    sub_thread = await ensure_submissions_thread(bot, event_id, interaction.guild, event["name"])
+    sub_thread = await ensure_submissions_thread(interaction.client, event_id, interaction.guild, event["name"])
 
     await interaction.followup.send(
         f"✅ **{event['name']}** started!\n"
         f"Spectator dashboard → {wpc.mention if wpc else '#whats-playing-now'}\n"
         f"Submissions thread → {sub_thread.mention if sub_thread else '#event-noticeboard'}\n"
         f"Use `/round briefing` to begin Day 1.",
-        ephemeral=True)
-    await log_immediate(bot, "Event Started", f"🏆 **{event['name']}** is LIVE", COLOUR_CRIMSON)
-
-tree.add_command(event_grp)
+        ephemeral=True,
+    )
+    await log_immediate(interaction.client, "Event Started", f"🏆 **{event['name']}** is LIVE", COLOUR_CRIMSON)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SLASH COMMANDS  —  REGISTRATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-reg_grp = app_commands.Group(name="register", description="Player registration",
-                              guild_ids=[GUILD_ID])
+reg_grp = app_commands.Group(
+    name="register",
+    description="Player registration",
+    guild_ids=[GUILD_ID],
+)
 
 @reg_grp.command(name="submit", description="Register and submit your army list for an event")
 @app_commands.describe(event_id="Select event", army="Your faction", detachment="Your detachment")
@@ -238,7 +299,6 @@ async def reg_submit(interaction: discord.Interaction, event_id: str, army: str,
     pending  = len(db_get_registrations(event_id, RS.PENDING))
     if approved + pending >= event["max_players"]:
         await interaction.response.send_message("❌ Event is full.", ephemeral=True); return
-    # Ensure they have at minimum an interest record
     db_upsert_registration(event_id, str(interaction.user.id),
                             interaction.user.display_name, RS.INTERESTED)
     await interaction.response.send_modal(ListSubmissionModal(event_id, army, detachment))
@@ -253,31 +313,37 @@ async def reg_drop(interaction: discord.Interaction, event_id: str):
     event = db_get_event(event_id)
     db_update_registration(event_id, str(interaction.user.id),
                             {"state": RS.DROPPED, "dropped_at": datetime.utcnow()})
-    # Mark inactive in standings
     db_update_standing(event_id, str(interaction.user.id), {"active": False})
     db_queue_log(f"{interaction.user.display_name} dropped from {event['name']}", event_id, level="drop")
-    # Notify TO
     ch = interaction.guild.get_channel(EVENT_NOTICEBOARD_ID)
     if ch:
         await ch.send(
             f"⚠️ **{interaction.user.display_name}** has dropped from **{event['name']}**.\n"
             f"Use `/round repair` before the next round if pairings need updating."
         )
-    await log_immediate(bot, "Player Dropped",
+    await log_immediate(
+        interaction.client,
+        "Player Dropped",
         f"⚠️ **{interaction.user.display_name}** dropped from **{event['name']}**",
-        COLOUR_AMBER)
+        COLOUR_AMBER,
+    )
     await interaction.response.send_message(
         f"You've been withdrawn from **{event['name']}**. Your existing results are preserved.",
-        ephemeral=True)
+        ephemeral=True,
+    )
 
 @reg_grp.command(name="list", description="[TO] View all registrations")
 @app_commands.describe(event_id="Select event")
 @app_commands.autocomplete(event_id=ac_all_events)
 async def reg_list(interaction: discord.Interaction, event_id: str):
+    if not is_to(interaction):
+        await interaction.response.send_message("❌ TO only.", ephemeral=True); return
     event = db_get_event(event_id)
-    if not event: await interaction.response.send_message("❌ Not found.", ephemeral=True); return
-    regs  = db_get_registrations(event_id)
-    if not regs: await interaction.response.send_message("No registrations yet.", ephemeral=True); return
+    if not event:
+        await interaction.response.send_message("❌ Not found.", ephemeral=True); return
+    regs = db_get_registrations(event_id)
+    if not regs:
+        await interaction.response.send_message("No registrations yet.", ephemeral=True); return
     icons = {RS.INTERESTED:"✋", RS.PENDING:"⏳", RS.APPROVED:"✅", RS.REJECTED:"❌", RS.DROPPED:"🚫"}
     embed = discord.Embed(title=f"📋  Registrations — {event['name']}", color=COLOUR_SLATE)
     for state in [RS.APPROVED, RS.PENDING, RS.INTERESTED, RS.DROPPED, RS.REJECTED]:
@@ -286,7 +352,3 @@ async def reg_list(interaction: discord.Interaction, event_id: str):
             lines = [f"{icons[state]} {fe(r['army'])} **{r['player_username']}** — *{r['army']}*" for r in group]
             embed.add_field(name=state.capitalize(), value="\n".join(lines), inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
-
-tree.add_command(reg_grp)
-
-# ══════════════════════════════════════════════════════════════════════════════
