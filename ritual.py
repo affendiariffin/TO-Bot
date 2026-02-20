@@ -729,7 +729,7 @@ async def round_begin_ritual(interaction: discord.Interaction, event_id: str):
 # ── /roll ─────────────────────────────────────────────────────────────────────
 # Registered in main.py via tree.add_command(ritual.roll_dice)
 
-@app_commands.command(name="roll", description="Roll a D6", guild=GUILD)
+@app_commands.command(name="roll", description="Roll a D6")
 async def roll_dice(interaction: discord.Interaction):
     result = _random.randint(1, 6)
     await interaction.response.send_message(
