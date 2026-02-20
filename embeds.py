@@ -23,15 +23,17 @@ from typing import List, Optional
 from config import (COLOUR_GOLD, COLOUR_CRIMSON, COLOUR_AMBER, COLOUR_SLATE,
                     SEP, GAME_ROOM_PREFIX, TOURNAMENT_MISSIONS,
                     fe, faction_colour, room_colour, ts, ts_full)
-from state import GS, RndS, JCS, FMT
-from database import get_judges_for_guild  # only used in judge queue embed
+from state import GS, RndS, JCS, FMT, get_judges_for_guild
+from database import db_get_rounds
+from threads import calculate_rounds
 
 # ══════════════════════════════════════════════════════════════════════════════
 # EMBED BUILDERS  —  TV-bot design language
 # ══════════════════════════════════════════════════════════════════════════════
 
 def vp_bar(vp: int, max_vp: int = 120, width: int = 10) -> str:
-    """Unicode VP progress bar. ▓▓▓▓░░░░  85 VP"""
+    """Unicode VP progress bar.
+    e.g. vp_bar(85) → ▓▓▓▓▓▓▓░░░  85 VP"""
     if not max_vp:
         return ""
     filled = round((vp / max_vp) * width)
@@ -116,7 +118,6 @@ def build_pairings_embed(event: dict, round_obj: dict, games: List[dict], guild:
             continue
 
         room = g.get("room_number")
-        colour_bar = "█" * 3  # visual room indicator
         vc = discord.utils.find(
             lambda c: isinstance(c, discord.VoiceChannel) and c.name.startswith(GAME_ROOM_PREFIX)
                       and c.name.endswith(str(room)),
@@ -126,7 +127,6 @@ def build_pairings_embed(event: dict, round_obj: dict, games: List[dict], guild:
 
         status_icon = {GS.PENDING: "⏳", GS.SUBMITTED: "📋", GS.COMPLETE: "✅", GS.DISPUTED: "⚠️"}.get(g["state"], "⏳")
 
-        # Three-column VS layout — TV-bot pattern
         e1 = fe(g["player1_army"])
         e2 = fe(g["player2_army"])
         embed.add_field(
@@ -138,7 +138,7 @@ def build_pairings_embed(event: dict, round_obj: dict, games: List[dict], guild:
             ),
             inline=True,
         )
-        embed.add_field(name="​", value="**VS**", inline=True)   # zero-width space col
+        embed.add_field(name="​", value="**VS**", inline=True)
         embed.add_field(
             name="​",
             value=(
@@ -342,45 +342,24 @@ def build_judge_queue_embed(event: dict, calls: List[dict], round_obj: Optional[
         for j in judges:
             if j.get("call_id"):
                 roster_lines.append(f"🔴  **{j['name']}** — Room {j['room'] or '?'}")
+            elif j.get("online"):
+                roster_lines.append(f"🟢  **{j['name']}** — available")
             else:
-                roster_lines.append(f"🟢  **{j['name']}** — Available")
+                roster_lines.append(f"⚫  **{j['name']}** — offline")
+        embed.add_field(name="⚖️  Judges on Duty", value="\n".join(roster_lines), inline=False)
+
+    # ── Active calls ───────────────────────────────────────────────────────
+    for c in calls:
+        state_icon = "🔴" if c["state"] == JCS.OPEN else "🟡"
+        ack_info   = ""
+        if c["state"] == JCS.ACKNOWLEDGED:
+            ack_info = f"\n*Acknowledged by {c.get('acknowledged_by_name','—')}*"
         embed.add_field(
-            name=f"👥  Judges on Duty  ({len(judges)})",
-            value="\n".join(roster_lines) or "—",
+            name=f"{state_icon}  Room {c['room_number']}  —  {c['raised_by_name']}",
+            value=f"Called {ts(c['raised_at'])}{ack_info}",
             inline=False,
         )
 
-    # ── Individual calls ───────────────────────────────────────────────────
-    now = datetime.utcnow().replace(tzinfo=timezone.utc)
-    for i, c in enumerate(calls, 1):
-        raised = c["raised_at"]
-        if raised.tzinfo is None:
-            raised = raised.replace(tzinfo=timezone.utc)
-        waiting_secs = int((now - raised).total_seconds())
-        mins, secs   = divmod(waiting_secs, 60)
-        wait_str     = f"{mins}m {secs}s"
-
-        if c["state"] == JCS.OPEN:
-            icon   = "🔔"
-            status = "*Waiting for judge...*"
-        else:
-            icon   = "🚶"
-            judge_name = c.get("acknowledged_by_name") or "Judge"
-            status = f"**{judge_name}** en route"
-
-        embed.add_field(
-            name=f"{icon}  #{i}  Room {c['room_number']}  —  {wait_str}",
-            value=f"Raised by **{c['raised_by_name']}**\n{status}",
-            inline=True,
-        )
-        # zero-width spacer to keep pairs on same row for ≤2 calls
-        if i % 2 == 0 and i < len(calls):
-            embed.add_field(name="​", value="​", inline=True)
-
-    if round_obj and round_obj.get("deadline_at"):
-        embed.set_footer(
-            text=f"Round {round_obj['round_number']} · "
-                 f"closes {round_obj['deadline_at'].strftime('%H:%M UTC')}"
-        )
+    if round_obj:
+        embed.set_footer(text=f"Round {round_obj['round_number']}  ·  {event['name']}")
     return embed
-
