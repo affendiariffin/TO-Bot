@@ -617,8 +617,6 @@ async def team_approve_list(interaction: discord.Interaction, event_id: str, mem
     except: pass
 
 
-tree.add_command(team_grp)
-
 import random as _random
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -626,4 +624,3 @@ import random as _random
 # Simultaneous reveal via DM selection + DB polling
 # Public live dashboard in the Pairing Room thread
 # ══════════════════════════════════════════════════════════════════════════════
-
