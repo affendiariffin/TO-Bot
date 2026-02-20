@@ -27,7 +27,8 @@ from state import PS, TRS, FMT, is_to
 from database import *
 from services import ac_active_events
 from commands_teams import ensure_pairing_room_thread  # thread helper lives there
-from ritual_8s import run_ritual_8  # Teams 8s NTL ritual
+from commands_round import round_grp                   # begin-ritual hangs off /round
+from ritual_8s import run_ritual_8                     # Teams 8s NTL ritual
 
 
 def _layout_mission_pickers(slot: int, fmt: str, layout_winner: str) -> tuple:
@@ -726,8 +727,9 @@ async def round_begin_ritual(interaction: discord.Interaction, event_id: str):
 
 
 # ── /roll ─────────────────────────────────────────────────────────────────────
+# Registered in main.py via tree.add_command(ritual.roll_dice)
 
-@tree.command(name="roll", description="Roll a D6", guild=GUILD)
+@app_commands.command(name="roll", description="Roll a D6", guild=GUILD)
 async def roll_dice(interaction: discord.Interaction):
     result = _random.randint(1, 6)
     await interaction.response.send_message(
