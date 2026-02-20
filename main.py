@@ -10,9 +10,9 @@ Run with:  python main.py
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
-import asyncio, random as _random
+import asyncio
 
-from config import TOKEN, GUILD, GUILD_ID, LOG_BATCH_MINUTES
+from config import TOKEN, GUILD, GUILD_ID, LOG_BATCH_MINUTES, BOT_LOGS_ID
 from database import init_db, db_flush_logs, db_get_active_events, db_get_current_round
 from state import get_thread_reg
 from threads import restore_thread_registry
@@ -39,22 +39,12 @@ bot  = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
 # ── Register command groups ───────────────────────────────────────────────────
-# These group objects are defined in each command module; we import and add them.
-# (Each module defines its group at module level so autocomplete decorators bind.)
-
 tree.add_command(commands_event.event_grp)
 tree.add_command(commands_event.reg_grp)
 tree.add_command(commands_round.round_grp)
 tree.add_command(commands_round.result_grp)
 tree.add_command(commands_round_teams.result_team_grp)
 tree.add_command(commands_teams.team_grp)
-
-# Top-level guild commands (registered with guild= in their module decorators)
-# tree.add_command(commands_round.event_finish)       # already decorated
-# tree.add_command(commands_round.standings_cmd)
-# tree.add_command(commands_round.my_list)
-# tree.add_command(commands_round_teams.team_standings_cmd)
-# tree.add_command(ritual.roll_dice)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # BACKGROUND TASKS
@@ -64,7 +54,7 @@ tree.add_command(commands_teams.team_grp)
 async def flush_batch_logs():
     logs = db_flush_logs()
     if not logs or not any(bot.guilds): return
-    ch = bot.get_channel(commands_event.BOT_LOGS_ID)   # re-use config constant
+    ch = bot.get_channel(BOT_LOGS_ID)
     if not ch: return
     for log in logs:
         colour = discord.Color.red() if log["level"] == "error" else discord.Color.blue()
@@ -121,6 +111,8 @@ async def before_loops():
 @bot.event
 async def on_ready():
     init_db()
+    # Wire bot reference into command modules that need it
+    commands_event.init(bot)
     guild = bot.get_guild(GUILD_ID)
     if guild:
         await restore_thread_registry(bot, guild)
