@@ -46,6 +46,12 @@ tree.add_command(commands_round.result_grp)
 tree.add_command(commands_round_teams.result_team_grp)
 tree.add_command(commands_teams.team_grp)
 
+# ── Register top-level commands ───────────────────────────────────────────────
+tree.add_command(commands_round.event_finish)
+tree.add_command(commands_round.standings_cmd)
+tree.add_command(commands_round.my_list_cmd)
+tree.add_command(commands_round_teams.team_standings_cmd)
+
 # ══════════════════════════════════════════════════════════════════════════════
 # BACKGROUND TASKS
 # ══════════════════════════════════════════════════════════════════════════════
