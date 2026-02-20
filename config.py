@@ -5,6 +5,10 @@ Environment config, all Warhammer data (factions, detachments,
 missions, room colours), and small timestamp/colour helpers.
 
 Imported by: virtually every other module.
+
+NOTE: Variable names deliberately avoid the _ID suffix to prevent
+Railpack from treating them as build-time secrets (Railpack 0.17.2 bug).
+Railway dashboard variables should match the new names below.
 """
 import os
 from datetime import datetime, timezone
@@ -16,24 +20,25 @@ import discord
 # ══════════════════════════════════════════════════════════════════════════════
 
 TOKEN        = os.environ["DISCORD_TOKEN"]
-GUILD_ID     = int(os.environ["GUILD_ID"])
+GUILD_ID     = int(os.environ["GUILD"])          # Railway var: GUILD
 DATABASE_URL = os.environ["DATABASE_URL"]
 
-EVENT_NOTICEBOARD_ID  = int(os.getenv("EVENT_NOTICEBOARD_ID",  0))
-WHATS_PLAYING_ID      = int(os.getenv("WHATS_PLAYING_ID",      0))
-ANNOUNCEMENTS_ID      = int(os.getenv("ANNOUNCEMENTS_ID",      0))
-BOT_LOGS_ID           = int(os.getenv("BOT_LOGS_ID",           0))
-CREW_ROLE_ID          = int(os.getenv("CREW_ROLE_ID",          0))
-PLAYER_ROLE_ID        = int(os.getenv("PLAYER_ROLE_ID",        0))
-CAPTAINS_ROLE_ID      = int(os.getenv("CAPTAINS_ROLE_ID",      0))
-LOG_BATCH_MINUTES     = int(os.getenv("LOG_BATCH_MINUTES",     15))
+EVENT_NOTICEBOARD_ID  = int(os.getenv("EVENT_NOTICEBOARD",   0))   # Railway var: EVENT_NOTICEBOARD
+WHATS_PLAYING_ID      = int(os.getenv("WHATS_PLAYING",        0))   # Railway var: WHATS_PLAYING
+ANNOUNCEMENTS_ID      = int(os.getenv("ANNOUNCEMENTS_CHANNEL",0))   # Railway var: ANNOUNCEMENTS_CHANNEL
+BOT_LOGS_ID           = int(os.getenv("BOT_LOGS_CHANNEL",     0))   # Railway var: BOT_LOGS_CHANNEL
+CREW_ROLE_ID          = int(os.getenv("CREW_ROLE",            0))   # Railway var: CREW_ROLE
+PLAYER_ROLE_ID        = int(os.getenv("PLAYER_ROLE",          0))   # Railway var: PLAYER_ROLE
+CAPTAINS_ROLE_ID      = int(os.getenv("CAPTAINS_ROLE",        0))   # Railway var: CAPTAINS_ROLE
+LOG_BATCH_MINUTES     = int(os.getenv("LOG_BATCH_MINUTES",    15))
 
 GUILD = discord.Object(id=GUILD_ID)
 
+# ══════════════════════════════════════════════════════════════════════════════
 # WARHAMMER DATA
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Room accent colours — identical to TV-bot
+# Room accent colours
 ROOM_COLOURS: Dict[int, discord.Color] = {
     1:  discord.Color.from_rgb(180,  30,  30),   # Crimson
     2:  discord.Color.from_rgb( 30,  80, 180),   # Royal Blue
@@ -65,11 +70,10 @@ FACTION_EMOJIS = {
     "Necrons": "💀",                "Orks": "🟢",
     "Space Marines": "⚔️",         "Space Wolves": "🐺",
     "T'au Empire": "🔵",            "Thousand Sons": "🌀",
-    "Tyranids": "🦎",              "World Eaters": "🪓",
+    "Tyranids": "🦎",               "World Eaters": "🪓",
     "Other": "❓",
 }
 
-# Deterministic faction colours for list review cards (hashed from name)
 FACTION_COLOURS = {
     "Adepta Sororitas":    discord.Color.from_rgb(180,  60,  60),
     "Adeptus Custodes":    discord.Color.from_rgb(212, 175,  55),
@@ -97,27 +101,27 @@ FACTION_COLOURS = {
     "Space Wolves":        discord.Color.from_rgb( 60, 100, 160),
     "T'au Empire":         discord.Color.from_rgb( 60, 160, 200),
     "Thousand Sons":       discord.Color.from_rgb( 40,  80, 160),
-    "Tyranids":            discord.Color.from_rgb(140,  40, 120),
-    "World Eaters":        discord.Color.from_rgb(180,  20,  20),
-    "Other":               FALLBACK_COLOUR,
+    "Tyranids":            discord.Color.from_rgb(120, 180,  40),
+    "World Eaters":        discord.Color.from_rgb(180,  40,  20),
+    "Other":               discord.Color.from_rgb(100, 100, 100),
 }
 
 WARHAMMER_DETACHMENTS = {
-    "Adepta Sororitas": ["Hallowed Martyrs","Penitent Host","Bringers of Flame","Army of Faith","Champions of Faith","Other"],
-    "Adeptus Custodes": ["Shield Host","Talons of the Emperor","Null Maiden Vigil","Auric Champions","Solar Spearhead","Lions of the Emperor","Other"],
-    "Adeptus Mechanicus": ["Rad-Zone Corps","Skitarii Hunter Cohort","Data Psalm Conclave","Explorator Maniple","Cohort Cybernetica","Haloscreed Battle Clade","Other"],
-    "Aeldari": ["Warhost","Windrider Battlehost","Spirit Conclave","Guardian Battlehost","Aspect Host","Ghosts of the Webway","Devoted of Ynnead","Seer Council","Armored Warhost","Serpent's Brood","Other"],
-    "Astra Militarum": ["Combined Arms","Siege Regiment","Mechanised Assault","Hammer of the Emperor","Recon Element","Bridgehead Strike","Grizzled Company","Other"],
-    "Black Templars": ["Righteous Crusaders","Wrathful Procession","Other"],
-    "Blood Angels": ["Liberator Assault Group","The Lost Brethren","The Angelic Host","Angelic Inheritors","Rage-Cursed Onslaught","Other"],
-    "Chaos Daemons": ["Daemonic Incursion","Plague Legion","Scintillating Legion","Blood Legion","Legion of Excess","Other"],
-    "Chaos Knights": ["Traitoris Lance","Infernal Lance","Lords of Dread","Houndpack Lance","Iconoclast Fiefdom","Other"],
-    "Chaos Space Marines": ["Veterans of the Long War","Deceptors","Renegade Raiders","Dread Talons","Fellhammer Siege-Host","Pactbound Zealots","Chaos Cult","Soulforged Warpack","Creations of Bile","Cabal of Chaos","Nightmare Hunt","Other"],
-    "Dark Angels": ["Unforgiven Task Force","Inner Circle","Company of Hunters","Lion's Blade Task Force","Wrath of the Rock","Other"],
-    "Death Guard": ["Virulent Vectorium","Mortarion's Hammer","Champions of Contagion","Shamblerot Vectorium","Tallyband Summoners","Death Lord's Chosen","Flyblown Host","Other"],
+    "Adepta Sororitas": ["Hallowed Martyrs","Righteous Crusaders","Penitent Host","Army of Faith","Glorious Crusade","Other"],
+    "Adeptus Custodes": ["Shield Host","Talons of the Emperor","Auric Champions","Other"],
+    "Adeptus Mechanicus": ["Skitarii Maniple","Rad-Zone Corps","Cohort Cybernetica","Explorator Maniple","Other"],
+    "Aeldari": ["Aspect Host","Battle Host","Warhost","Strands of Fate","Other"],
+    "Astra Militarum": ["Combined Arms","Hammer of the Emperor","Mechanised Infantry","Bridgehead Assault","Leman Russ Spearhead","Other"],
+    "Black Templars": ["Righteous Crusaders","Templar Brethren","Other"],
+    "Blood Angels": ["Liberator Assault Group","Sons of Sanguinius","Other"],
+    "Chaos Daemons": ["Daemonic Incursion","Plague Purge","Warpstorm","Excess of Violence","Other"],
+    "Chaos Knights": ["Traitoris Lance","Iconoclast Horde","Other"],
+    "Chaos Space Marines": ["Warband","Raiders","Pactbound Zealots","Council of Traitors","Soulforged Pack","Other"],
+    "Dark Angels": ["Unforgiven Task Force","Deathwing Strikeforce","Ravenwing Attackers","Inner Circle Task Force","Other"],
+    "Death Guard": ["Plague Company","Inexorable Advance","Other"],
     "Deathwatch": ["Black Spear Task Force","Other"],
-    "Drukhari": ["Realspace Raiders","Skysplinter Assault","Spectacle of Spite","Covenite Coterie","Kabalite Cartel","Reaper's Wager","Other"],
-    "Emperor's Children": ["Mercurial Host","Peerless Bladesmen","Rapid Evisceration","Carnival of Excess","Coterie of the Conceited","Slaanesh's Chosen","Court of the Phoenician","Other"],
+    "Drukhari": ["Realspace Raiders","Court of the Archon","Skysplinter Assault","Other"],
+    "Emperor's Children": ["Kakophoni","Flawless Blades","Carnival of Excess","Coterie of the Conceited","Slaanesh's Chosen","Court of the Phoenician","Other"],
     "Genestealer Cults": ["Host of Ascension","Xenocreed Congregation","Biosanctic Broodsurge","Outlander Claw","Brood Brother Auxilia","Final Day","Other"],
     "Grey Knights": ["Brotherhood Strike","Hallowed Conclave","Banishers","Sanctic Spearhead","Augurium Taskforce","Warpbane Task Force","Other"],
     "Imperial Agents": ["Ordo Xenos Alien Hunters","Ordo Hereticus Purgation Force","Ordo Malleus","Imperialis Fleet","Veiled Blade Elimination Force","Other"],
@@ -160,6 +164,10 @@ TOURNAMENT_MISSIONS = {
 
 GAME_ROOM_PREFIX = "Game Room"
 
+# ══════════════════════════════════════════════════════════════════════════════
+# HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
 def fe(army: str) -> str:
     """Faction emoji shorthand."""
     return FACTION_EMOJIS.get(army, "⚔️")
@@ -187,4 +195,3 @@ def ts_full(dt: datetime) -> str:
     return f"<t:{int(dt.timestamp())}:F>"
 
 SEP = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-
