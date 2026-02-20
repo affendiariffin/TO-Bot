@@ -51,7 +51,7 @@ tree.add_command(commands_round.event_finish)
 tree.add_command(commands_round.standings_cmd)
 tree.add_command(commands_round.my_list_cmd)
 tree.add_command(commands_round_teams.team_standings_cmd)
-tree.add_command(ritual.roll_dice)
+tree.add_command(ritual.roll_dice, guild=GUILD)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # BACKGROUND TASKS
