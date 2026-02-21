@@ -446,59 +446,6 @@ def build_spectator_dashboard_embed(
 
 def build_standings_embed(event: dict, standings: List[dict], final: bool = False) -> discord.Embed:
     """
-    Standalone /standings command embed — same VP-per-round format as the
-    dashboard, with total VP and VP diff appended for the full detailed view.
-    """
-    from database import db_get_results_by_player
-    from threads  import calculate_rounds
-
-    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
-    title  = f"🏆  Final Standings — {event['name']}" if final else f"📊  Standings — {event['name']}"
-    colour = COLOUR_GOLD if final else COLOUR_SLATE
-
-    if not standings:
-        return discord.Embed(title=title, description="No results yet.", color=colour)
-
-    rounds       = db_get_rounds(event["event_id"])
-    done_rounds  = sum(1 for r in rounds if r["state"] == RndS.COMPLETE)
-    total_rounds = calculate_rounds(event["max_players"])
-    p_results    = db_get_results_by_player(event["event_id"])
-
-    max_name = max((len(s["player_username"]) for s in standings), default=8)
-    name_w   = min(max_name, 18)
-    SLOT_W   = 4
-
-    lines = []
-    for i, s in enumerate(standings, 1):
-        pid    = s["player_id"]
-        name   = s["player_username"][:name_w].ljust(name_w)
-        medal  = medals.get(i, f"{i:>2}.")
-        vp_tot = s.get("vp_total", 0)
-        vdiff  = s.get("vp_diff", 0)
-
-        pr    = p_results.get(pid, {})
-        slots = [_round_slot(pr.get(rn)).rjust(SLOT_W) for rn in range(1, total_rounds + 1)]
-        score_str = " / ".join(slots)
-
-        lines.append(f"`{medal} {name}  {score_str}   {vp_tot}VP ({vdiff:+})`")
-
-    embed = discord.Embed(title=title, description="\n".join(lines), color=colour)
-
-    if not final:
-        embed.set_footer(
-            text=(
-                f"Round {done_rounds}/{total_rounds}  ·  "
-                f"Format: VP scored + W/L/D per round  ·  "
-                f"Last updated {datetime.utcnow().strftime('%H:%M')} UTC"
-            )
-        )
-    else:
-        embed.set_footer(text="Tournament complete  ·  Results submitted to Scorebot for ELO calculation")
-
-    return embed
-
-def build_standings_embed(event: dict, standings: List[dict], final: bool = False) -> discord.Embed:
-    """
     /standings command embed — completed rounds only, with total VP and VP diff.
     """
     from database import db_get_results_by_player
