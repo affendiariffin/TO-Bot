@@ -12,11 +12,11 @@ from discord import app_commands
 from discord.ext import commands, tasks
 import asyncio
 
-from config import TOKEN, GUILD, GUILD_ID, LOG_BATCH_MINUTES, BOT_LOGS_ID
+from config import TOKEN, GUILD, GUILD_ID, LOG_BATCH_MINUTES, BOT_LOGS_ID, GAME_ROOM_PREFIX, CREW_ROLE_ID
 from database import init_db, db_flush_logs, db_get_active_events, db_get_current_round
 from state import get_thread_reg
 from threads import restore_thread_registry
-from from services import refresh_spectator_dashboard, _refresh_judges_on_duty, log_immediate
+from services import refresh_spectator_dashboard, _refresh_judges_on_duty, log_immediate, refresh_standings_card
 
 # ── Command modules ───────────────────────────────────────────────────────────
 import commands_event
@@ -152,9 +152,6 @@ async def on_voice_state_update(
     Refresh the Judges on Duty card whenever a crew member or admin
     moves into or out of a Game Room voice channel.
     """
-    from config import CREW_ROLE_ID, GAME_ROOM_PREFIX
-    from state  import get_thread_reg
-
     # Only care about crew / admins
     is_crew = (
         member.guild_permissions.administrator
