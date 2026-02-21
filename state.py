@@ -1,16 +1,16 @@
 """
 state.py — FND TTS Tournament Bot
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-State-machine enums (ES, FMT, TS, TRS, PS, RS, RndS, GS, JCS),
-permission helper is_to(), and in-memory registries:
-  • judge_roster  — which judges are on-duty / handling which call
-  • thread_registry — cached Discord thread IDs per event
+State-machine enums, permission helper, and in-memory thread registry.
+
+Judge availability is derived live from voice channel presence —
+no in-memory roster or call tracking needed here.
 
 Imported by: database.py, threads.py, views.py, commands_*.py, ritual.py
 """
 import discord
 from typing import Dict, List
-from config import CREW_ROLE_ID
+from config import CREW_ROLE_ID, GAME_ROOM_PREFIX
 
 # ══════════════════════════════════════════════════════════════════════════════
 # STATE ENUMS
@@ -24,11 +24,11 @@ class ES:   # EventState
     COMPLETE     = "complete"
 
 class FMT:  # Format
-    SINGLES  = "singles"
+    SINGLES   = "singles"
     TWO_V_TWO = "2v2"
-    TEAMS_3  = "teams_3"
-    TEAMS_5  = "teams_5"
-    TEAMS_8  = "teams_8"
+    TEAMS_3   = "teams_3"
+    TEAMS_5   = "teams_5"
+    TEAMS_8   = "teams_8"
 
     @staticmethod
     def team_size(fmt: str) -> int:
@@ -40,7 +40,6 @@ class FMT:  # Format
 
     @staticmethod
     def phase_count(fmt: str) -> int:
-        """Number of defender/attacker phases in the pairing ritual."""
         return {FMT.TEAMS_3: 1, FMT.TEAMS_5: 2, FMT.TEAMS_8: 3}.get(fmt, 0)
 
     @staticmethod
@@ -87,7 +86,8 @@ class GS:   # GameState
     DISPUTED  = "disputed"
     BYE       = "bye"
 
-class JCS:  # JudgeCallState
+# JCS kept for DB schema compatibility — existing rows still reference these values
+class JCS:
     OPEN         = "open"
     ACKNOWLEDGED = "acknowledged"
     CLOSED       = "closed"
@@ -105,70 +105,69 @@ def is_to(interaction: discord.Interaction) -> bool:
     return False
 
 # ══════════════════════════════════════════════════════════════════════════════
-# IN-MEMORY MULTI-JUDGE STATUS  (ephemeral — resets on restart safely)
+# JUDGE AVAILABILITY  —  derived from voice channel presence
 # ══════════════════════════════════════════════════════════════════════════════
 #
-# Structure: judge_roster[event_id][judge_id] = {"name": str, "call_id": str|None, "room": int|None}
-# A judge is "busy" when call_id is not None.
-# The roster is populated whenever a judge acknowledges a call or is looked up.
+# A judge is AVAILABLE if they are NOT in a voice channel whose name starts
+# with GAME_ROOM_PREFIX (e.g. "Game Room").
+# A judge is IN-GAME (busy) if they ARE in such a channel.
+# No in-memory tracking required — Discord's member.voice is the source of truth.
 
-judge_roster: Dict[str, Dict[str, dict]] = {}
-
-def get_judge_roster(event_id: str) -> Dict[str, dict]:
-    return judge_roster.setdefault(event_id, {})
-
-def register_judge(event_id: str, judge_id: str, judge_name: str):
-    roster = get_judge_roster(event_id)
-    if judge_id not in roster:
-        roster[judge_id] = {"name": judge_name, "call_id": None, "room": None}
-
-def judge_take_call(event_id: str, judge_id: str, judge_name: str, call_id: str, room: int):
-    roster = get_judge_roster(event_id)
-    roster[judge_id] = {"name": judge_name, "call_id": call_id, "room": room}
-
-def judge_release_call(event_id: str, judge_id: str):
-    roster = get_judge_roster(event_id)
-    if judge_id in roster:
-        roster[judge_id]["call_id"] = None
-        roster[judge_id]["room"]    = None
-
-def get_judges_for_guild(guild: discord.Guild, event_id: str) -> List[dict]:
+def _judge_voice_status(member: discord.Member) -> tuple[bool, str | None]:
     """
-    Return list of dicts describing every judge on duty for this event.
-    Includes all Crew role members + admins visible in the guild.
-    Merges with in-memory call status.
+    Returns (in_game_room, channel_name_or_None).
+    Checks if the member is currently in a Game Room voice channel.
     """
-    roster = get_judge_roster(event_id)
-    judges = []
-    seen   = set()
-    # Crew role members
+    vc = member.voice
+    if vc and vc.channel and vc.channel.name.startswith(GAME_ROOM_PREFIX):
+        return True, vc.channel.name
+    return False, None
+
+def get_judges_for_guild(guild: discord.Guild) -> List[dict]:
+    """
+    Return all on-duty judges (Crew role members + admins) with live
+    availability status based on their current voice channel.
+
+    Each entry:
+      {
+        "id":        str,
+        "name":      str,
+        "available": bool,      # True = not in a Game Room (free to DM)
+        "room":      str|None,  # e.g. "Game Room 3" if busy
+        "mention":   str,       # discord mention string for DM instructions
+      }
+    """
+    seen: set[str] = set()
+    judges: List[dict] = []
+
+    def _entry(m: discord.Member) -> dict:
+        in_room, room_name = _judge_voice_status(m)
+        return {
+            "id":        str(m.id),
+            "name":      m.display_name,
+            "available": not in_room,
+            "room":      room_name,
+            "mention":   m.mention,
+        }
+
+    # Crew role members first
     if CREW_ROLE_ID:
         crew_role = guild.get_role(CREW_ROLE_ID)
         if crew_role:
             for m in crew_role.members:
                 sid = str(m.id)
                 seen.add(sid)
-                status = roster.get(sid, {})
-                judges.append({
-                    "id":      sid,
-                    "name":    m.display_name,
-                    "call_id": status.get("call_id"),
-                    "room":    status.get("room"),
-                    "online":  m.status != discord.Status.offline if hasattr(m, "status") else True,
-                })
+                judges.append(_entry(m))
+
     # Admins not already listed
     for m in guild.members:
         sid = str(m.id)
-        if sid in seen: continue
-        if m.guild_permissions.administrator and not m.bot:
-            status = roster.get(sid, {})
-            judges.append({
-                "id":      sid,
-                "name":    m.display_name,
-                "call_id": status.get("call_id"),
-                "room":    status.get("room"),
-                "online":  True,
-            })
+        if sid in seen or m.bot:
+            continue
+        if m.guild_permissions.administrator:
+            seen.add(sid)
+            judges.append(_entry(m))
+
     return judges
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -179,7 +178,7 @@ def get_judges_for_guild(guild: discord.Guild, event_id: str) -> List[dict]:
 #   "submissions":  thread_id,
 #   "lists":        thread_id,
 #   "rounds":       {round_number: thread_id},
-#   "queue_msg_id": message_id,   # judge queue embed in noticeboard
+#   "judge_msg_id": message_id,   # Judges on Duty card in #event-noticeboard
 # }
 
 thread_registry: Dict[str, dict] = {}
@@ -189,9 +188,5 @@ def get_thread_reg(event_id: str) -> dict:
         "submissions":  None,
         "lists":        None,
         "rounds":       {},
-        "queue_msg_id": None,
+        "judge_msg_id": None,
     })
-
-# ══════════════════════════════════════════════════════════════════════════════
-# DATABASE  —  CONNECTION + INIT
-# ══════════════════════════════════════════════════════════════════════════════
