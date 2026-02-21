@@ -6,22 +6,23 @@ Background service coroutines and autocomplete helpers.
 Functions:
   • refresh_spectator_dashboard
   • log_immediate
-  • standings card refresh
-  • refresh_standings_card()
+  • refresh_standings_card
+  • _refresh_judges_on_duty
   • Autocomplete: ac_active_events, ac_all_events, ac_missions,
                   ac_armies, ac_detachments, ac_pending_regs,
                   ac_approved_regs, ac_active_games, ac_complete_games
 
-Imported by: all command modules and tasks.py
+Imported by: all command modules and main.py
 """
 import discord
 from discord import app_commands
+from datetime import datetime
 from typing import List
-from config import WHATS_PLAYING_ID, EVENT_NOTICEBOARD_ID, WARHAMMER_ARMIES, TOURNAMENT_MISSIONS
+from config import (WHATS_PLAYING_ID, EVENT_NOTICEBOARD_ID, BOT_LOGS_ID,
+                    WARHAMMER_ARMIES, WARHAMMER_DETACHMENTS, TOURNAMENT_MISSIONS)
 from state import get_thread_reg, GS, RS
 from database import *
-from embeds import build_spectator_dashboard_embed, build_judge_queue_embed
-from refresh_dashboards task
+from embeds import build_spectator_dashboard_embed, build_judges_on_duty_embed, build_standings_embed
 
 # ══════════════════════════════════════════════════════════════════════════════
 # DASHBOARD REFRESH HELPERS
@@ -63,10 +64,6 @@ async def refresh_standings_card(bot, event_id: str):
     Called from the refresh_dashboards background task alongside
     refresh_spectator_dashboard and _refresh_judges_on_duty.
     """
-    from state import get_thread_reg
-    from embeds import build_standings_embed
-    from database import db_get_event, db_get_standings
-
     event = db_get_event(event_id)
     if not event:
         return
@@ -90,6 +87,35 @@ async def refresh_standings_card(bot, event_id: str):
         await msg.edit(embed=embed)
     except (discord.NotFound, discord.HTTPException):
         pass   # Card was deleted — admin will re-pin manually
+
+async def _refresh_judges_on_duty(bot, event_id: str, guild: discord.Guild):
+    """
+    Refresh (or post) the Judges on Duty card in #event-noticeboard.
+
+    Called:
+      • Every 5 min by the refresh_dashboards background task
+      • Immediately on on_voice_state_update when a crew member
+        joins or leaves a Game Room (see main.py hook below)
+    """
+    ch = bot.get_channel(EVENT_NOTICEBOARD_ID)
+    if not ch:
+        return
+
+    round_obj = db_get_current_round(event_id)
+    embed     = build_judges_on_duty_embed(guild, round_obj)
+    reg       = get_thread_reg(event_id)
+
+    try:
+        if reg.get("judge_msg_id"):
+            msg = await ch.fetch_message(int(reg["judge_msg_id"]))
+            await msg.edit(embed=embed)
+        else:
+            msg = await ch.send(embed=embed)
+            reg["judge_msg_id"] = msg.id
+    except (discord.NotFound, discord.HTTPException):
+        # Message was deleted — repost
+        msg = await ch.send(embed=embed)
+        reg["judge_msg_id"] = msg.id
 
 # ══════════════════════════════════════════════════════════════════════════════
 # AUTOCOMPLETE FUNCTIONS
@@ -115,7 +141,7 @@ async def ac_armies(i: discord.Interaction, current: str):
             for a in WARHAMMER_ARMIES if current.lower() in a.lower()][:25]
 
 async def ac_detachments(i: discord.Interaction, current: str):
-    army = i.namespace.army or ""
+    army = getattr(i.namespace, "army", "") or ""
     dets = WARHAMMER_DETACHMENTS.get(army, ["Other"])
     return [app_commands.Choice(name=d, value=d)
             for d in dets if current.lower() in d.lower()][:25]
@@ -166,32 +192,3 @@ async def ac_complete_games(i: discord.Interaction, current: str):
         if g["state"] == GS.COMPLETE and not g["is_bye"]
         and current.lower() in f"{g['player1_username']} {g['player2_username']}".lower()
     ][:25]
-
-async def _refresh_judges_on_duty(bot, event_id: str, guild: discord.Guild):
-    """
-    Refresh (or post) the Judges on Duty card in #event-noticeboard.
-
-    Called:
-      • Every 5 min by the refresh_dashboards background task
-      • Immediately on on_voice_state_update when a crew member
-        joins or leaves a Game Room (see main.py hook below)
-    """
-    ch = bot.get_channel(EVENT_NOTICEBOARD_ID)
-    if not ch:
-        return
-
-    round_obj = db_get_current_round(event_id)
-    embed     = build_judges_on_duty_embed(guild, round_obj)
-    reg       = get_thread_reg(event_id)
-
-    try:
-        if reg.get("judge_msg_id"):
-            msg = await ch.fetch_message(int(reg["judge_msg_id"]))
-            await msg.edit(embed=embed)
-        else:
-            msg = await ch.send(embed=embed)
-            reg["judge_msg_id"] = msg.id
-    except (discord.NotFound, discord.HTTPException):
-        # Message was deleted — repost
-        msg = await ch.send(embed=embed)
-        reg["judge_msg_id"] = msg.id
