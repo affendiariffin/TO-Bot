@@ -249,30 +249,90 @@ async def event_lock_lists(interaction: discord.Interaction, event_id: str):
 
 @event_grp.command(name="start", description="Start the event and post spectator dashboard")
 @app_commands.autocomplete(event_id=ac_active_events)
+@event_grp.command(name="start", description="Start the event — post pinned cards and create threads")
+@app_commands.autocomplete(event_id=ac_active_events)
 async def event_start(interaction: discord.Interaction, event_id: str):
     if not is_to(interaction):
         await interaction.response.send_message("❌ TO only.", ephemeral=True); return
     await interaction.response.defer(ephemeral=True)
+
     event = db_get_event(event_id)
     if not event:
         await interaction.followup.send("❌ Not found.", ephemeral=True); return
+
     db_update_event(event_id, {"state": ES.IN_PROGRESS})
+
+    nb_ch = interaction.guild.get_channel(EVENT_NOTICEBOARD_ID)
+    regs  = db_get_registrations(event_id, RS.APPROVED)
+    total_rounds = calculate_rounds(event["max_players"])
+
+    pinned_msgs = []
+
+    # ── 5 pinned cards ────────────────────────────────────────────────────
+    if nb_ch:
+        for embed in [
+            build_event_main_embed(event, regs),
+            build_schedule_embed(event),
+            build_missions_embed(event),
+            build_judges_on_duty_embed(interaction.guild),   # Chunk 1
+            build_standings_embed(event, []),                # Chunk 2 — empty to start
+        ]:
+            msg = await nb_ch.send(embed=embed)
+            pinned_msgs.append(msg)
+            try:
+                await msg.pin()
+            except discord.HTTPException:
+                pass
+            await asyncio.sleep(0.5)
+
+        # Store judge card msg_id and standings msg_id for refresh
+        reg = get_thread_reg(event_id)
+        reg["judge_msg_id"]    = pinned_msgs[3].id
+        reg["standings_msg_id"] = pinned_msgs[4].id
+        db_update_event(event_id, {
+            "noticeboard_msg_id": str(pinned_msgs[0].id),
+            "standings_msg_id":   str(pinned_msgs[4].id),
+        })
+
+    # ── Pre-create all round pairing threads (empty) ──────────────────────
+    round_threads = await ensure_all_round_threads(
+        interaction.client, event_id, interaction.guild,
+        event["name"], total_rounds,
+    )
+
+    # ── Army Lists thread ─────────────────────────────────────────────────
+    lists_thread = await ensure_lists_thread(
+        interaction.client, event_id, interaction.guild, event["name"]
+    )
+
+    # ── Spectator dashboard in #what's-playing-now ────────────────────────
     wpc = interaction.guild.get_channel(WHATS_PLAYING_ID)
     if wpc:
-        embed = build_spectator_dashboard_embed(event, None, [], [], interaction.guild)
-        msg   = await wpc.send(embed=embed)
-        try: await msg.pin()
-        except: pass
-        db_update_event(event_id, {"spectator_msg_id": str(msg.id)})
+        standings = db_get_standings(event_id)
+        dash_embed = build_spectator_dashboard_embed(event, None, [], standings, interaction.guild)
+        dash_msg   = await wpc.send(embed=dash_embed)
+        try:
+            await dash_msg.pin()
+        except discord.HTTPException:
+            pass
+        db_update_event(event_id, {"spectator_msg_id": str(dash_msg.id)})
 
-    sub_thread = await ensure_submissions_thread(interaction.client, event_id, interaction.guild, event["name"])
-
+    thread_list = "  ·  ".join(
+        f"Round {rn}" for rn in sorted(round_threads.keys())
+    )
     await interaction.followup.send(
         f"✅ **{event['name']}** started!\n"
-        f"Spectator dashboard → {wpc.mention if wpc else '#whats-playing-now'}\n"
-        f"Submissions thread → {sub_thread.mention if sub_thread else '#event-noticeboard'}\n"
+        f"5 cards pinned in {nb_ch.mention if nb_ch else '#event-noticeboard'}\n"
+        f"Round threads created: {thread_list}\n"
+        f"Army Lists thread: {lists_thread.mention if lists_thread else '—'}\n"
         f"Use `/round briefing` to begin Day 1.",
         ephemeral=True,
+    )
+    await log_immediate(
+        interaction.client, "Event Started",
+        f"🏆 **{event['name']}** is LIVE\n"
+        f"{total_rounds} round threads created  ·  5 cards pinned",
+        COLOUR_CRIMSON,
     )
     await log_immediate(interaction.client, "Event Started", f"🏆 **{event['name']}** is LIVE", COLOUR_CRIMSON)
 
