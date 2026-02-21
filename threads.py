@@ -12,6 +12,7 @@ Sections:
   • assign_rooms, team Swiss pairing
   • Scoring formulas: ntl_gp, ntl_team_result, twovtwo_team_result
   • db_get_team_standings / db_upsert_team_standing / db_apply_team_result
+  • ensure_all_round_threads
 
 Imported by: services.py, commands_*.py, ritual.py
 """
@@ -115,47 +116,93 @@ async def ensure_submissions_thread(bot, event_id: str, guild: discord.Guild,
         )
     return thread
 
-async def ensure_lists_thread(bot, event_id: str, guild: discord.Guild,
-                               event_name: str) -> Optional[discord.Thread]:
-    """Get or create the Army Lists private thread for an event."""
+async def ensure_lists_thread(
+    bot, event_id: str, guild: discord.Guild, event_name: str,
+) -> Optional[discord.Thread]:
+    """
+    Get or create the PUBLIC Army Lists thread in #event-noticeboard.
+    Long player names are handled at the embed level (build_player_list_embed).
+    """
+    from state import get_thread_reg
+    from database import db_update_event
+    from config import EVENT_NOTICEBOARD_ID
+
     reg = get_thread_reg(event_id)
-    if reg["lists"]:
+    if reg.get("lists"):
         t = guild.get_thread(reg["lists"])
-        if t: return t
+        if t:
+            return t
+
     ch = bot.get_channel(EVENT_NOTICEBOARD_ID)
-    if not ch: return None
-    thread = await create_private_thread(ch, f"📋 Army Lists — {event_name}")
-    if thread:
-        reg["lists"] = thread.id
-        db_update_event(event_id, {"lists_thread_id": str(thread.id)})
-        regs = db_get_registrations(event_id, RS.APPROVED)
-        player_ids = [r["player_id"] for r in regs]
-        await _add_thread_members(thread, guild, player_ids)
+    if not ch:
+        return None
+
+    try:
+        thread = await ch.create_thread(
+            name=f"📋  Army Lists  —  {event_name}",
+            type=discord.ChannelType.public_thread,
+            auto_archive_duration=10080,
+        )
+    except discord.HTTPException as e:
+        print(f"⚠️ Army Lists thread creation failed: {e}")
+        return None
+
+    reg["lists"] = thread.id
+    db_update_event(event_id, {"lists_thread_id": str(thread.id)})
     return thread
 
-async def ensure_round_thread(bot, event_id: str, round_number: int,
-                               guild: discord.Guild, event_name: str,
-                               anchor_msg: discord.Message = None) -> Optional[discord.Thread]:
-    """Get or create the private thread for a round."""
+async def ensure_all_round_threads(
+    bot, event_id: str, guild: discord.Guild,
+    event_name: str, total_rounds: int,
+) -> dict:
+    """
+    Pre-create ALL round pairing threads when the event starts.
+    Threads are created empty — content is posted by /round start.
+    Returns {round_number: thread} for all rounds.
+    """
+    threads = {}
+    for rn in range(1, total_rounds + 1):
+        t = await ensure_round_thread(bot, event_id, rn, guild, event_name)
+        if t:
+            threads[rn] = t
+        await asyncio.sleep(0.5)  # rate limit safety
+    return threads
+
+async def ensure_round_thread(
+    bot, event_id: str, round_number: int,
+    guild: discord.Guild, event_name: str,
+) -> Optional[discord.Thread]:
+    """
+    Get or create the PUBLIC thread for a round's pairings in #event-noticeboard.
+    Created empty when the event starts; content posted when the round begins.
+    """
+    from state import get_thread_reg
+    from database import db_update_round_thread, db_get_registrations, RS
+    from config import EVENT_NOTICEBOARD_ID
+
     reg = get_thread_reg(event_id)
     existing_id = reg["rounds"].get(round_number)
     if existing_id:
         t = guild.get_thread(existing_id)
-        if t: return t
+        if t:
+            return t
+
     ch = bot.get_channel(EVENT_NOTICEBOARD_ID)
-    if not ch: return None
-    thread = await create_private_thread(ch, f"⚔️ Round {round_number} — {event_name}")
-    if thread:
-        reg["rounds"][round_number] = thread.id
-        db_update_round_thread(event_id, round_number, str(thread.id))
-        regs = db_get_registrations(event_id, RS.APPROVED)
-        player_ids = [r["player_id"] for r in regs]
-        await _add_thread_members(thread, guild, player_ids)
-        await thread.send(
-            f"⚔️ **Round {round_number} — {event_name}**\n"
-            f"Use the buttons below your pairing to submit results or call a judge.\n"
-            f"*This thread is private — visible only to players, Crew, and admins.*"
+    if not ch:
+        return None
+
+    try:
+        thread = await ch.create_thread(
+            name=f"⚔️  Round {round_number} Pairings",
+            type=discord.ChannelType.public_thread,
+            auto_archive_duration=10080,  # 7 days
         )
+    except discord.HTTPException as e:
+        print(f"⚠️ Round thread creation failed (Round {round_number}): {e}")
+        return None
+
+    reg["rounds"][round_number] = thread.id
+    db_update_round_thread(event_id, round_number, str(thread.id))
     return thread
 
 async def add_player_to_event_threads(bot, event_id: str, guild: discord.Guild,
