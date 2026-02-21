@@ -13,7 +13,10 @@ Functions:
   • build_list_review_header
   • build_player_list_embed
   • build_judges_on_duty_embed
-  • bbuild_standings_embed
+  • build_standings_embed
+  • build_event_main_embed
+  • build_schedule_embed
+  • build_missions_embed
 
 
 Imported by: services.py, views.py, commands_*.py
@@ -31,6 +34,103 @@ from threads import calculate_rounds
 # ══════════════════════════════════════════════════════════════════════════════
 # EMBED BUILDERS  —  TV-bot design language
 # ══════════════════════════════════════════════════════════════════════════════
+
+def build_event_main_embed(event: dict, regs: list) -> discord.Embed:
+    """
+    Card 1 — Event Main Details.
+    Pinned by admin in #event-noticeboard.
+    Shows core event info + current player roster.
+    """
+    from threads import calculate_rounds
+    m           = TOURNAMENT_MISSIONS.get(event["mission_code"], {})
+    sd, ed      = event["start_date"], event["end_date"]
+    multi       = sd != ed
+    dstr        = (f"{sd.strftime('%a %d %b')} — {ed.strftime('%a %d %b %Y')}"
+                   if multi else sd.strftime("%A %d %B %Y"))
+    total_rounds = calculate_rounds(event["max_players"])
+    fmt_label   = {
+        "singles": "Singles", "2v2": "2v2",
+        "teams_3": "Teams 3s", "teams_5": "Teams 5s", "teams_8": "Teams 8s",
+    }.get(event.get("format", "singles"), "Singles")
+
+    approved = [r for r in regs if r["state"] == "approved"]
+    roster   = "\n".join(
+        f"{fe(r['army'])}  **{r['player_username']}**  ·  *{r['army']}*"
+        for r in approved
+    ) or "*No players confirmed yet.*"
+
+    embed = discord.Embed(
+        title=f"🏆  {event['name']}",
+        description=f"**Warhammer 40,000  ·  Tabletop Simulator  ·  {fmt_label}**\n{SEP}",
+        color=COLOUR_GOLD,
+    )
+    embed.add_field(name="📅  Date",    value=dstr,                               inline=True)
+    embed.add_field(name="⚔️  Points",  value=f"**{event['points_limit']} pts**", inline=True)
+    embed.add_field(name="🎲  Format",  value=f"Swiss · **{total_rounds} rounds** · {event['rounds_per_day']}/day", inline=True)
+    embed.add_field(name=f"👥  Players  ({len(approved)}/{event['max_players']})",
+                    value=roster, inline=False)
+    if event.get("terrain_layout"):
+        embed.add_field(name="🏗️  Terrain", value=event["terrain_layout"], inline=False)
+    embed.set_footer(text="Pinned  ·  Updated by crew as registrations are confirmed")
+    return embed
+
+
+def build_schedule_embed(event: dict) -> discord.Embed:
+    """
+    Card 2 — Schedule.
+    Pinned by admin. Shows day/round breakdown and key times.
+    Admin edits the message manually if times change.
+    """
+    from threads import calculate_rounds
+    total_rounds = calculate_rounds(event["max_players"])
+    rpd          = event["rounds_per_day"]
+    days         = math.ceil(total_rounds / rpd)
+    sd           = event["start_date"]
+
+    lines = []
+    round_counter = 1
+    for d in range(1, days + 1):
+        rounds_today = []
+        for _ in range(rpd):
+            if round_counter > total_rounds:
+                break
+            rounds_today.append(f"Round {round_counter}")
+            round_counter += 1
+        day_label = (sd + timedelta(days=d - 1)).strftime("%a %d %b") if hasattr(sd, "strftime") else f"Day {d}"
+        lines.append(f"**Day {d}  ·  {day_label}**\n" + "  ·  ".join(rounds_today))
+
+    embed = discord.Embed(
+        title=f"📅  Schedule  —  {event['name']}",
+        description="\n\n".join(lines) or "*Schedule not yet set.*",
+        color=COLOUR_GOLD,
+    )
+    embed.set_footer(text="Pinned  ·  All times in UTC  ·  Check #event-noticeboard for round updates")
+    return embed
+
+
+def build_missions_embed(event: dict) -> discord.Embed:
+    """
+    Card 3 — Missions.
+    Shows the mission pack info for the event.
+    """
+    m = TOURNAMENT_MISSIONS.get(event["mission_code"], {})
+
+    embed = discord.Embed(
+        title=f"🗺️  Mission Pack  —  {event['name']}",
+        color=COLOUR_GOLD,
+    )
+    embed.add_field(name="Mission",    value=f"**{m.get('name', '—')}**",           inline=True)
+    embed.add_field(name="Deployment", value=f"*{m.get('deployment', '—')}*",        inline=True)
+    embed.add_field(name="Layouts",    value=", ".join(m.get("layouts", [])) or "—", inline=False)
+
+    scoring = (
+        "**Primary:** Secure objectives as per mission rules\n"
+        "**Secondary:** Chosen from your detachment's secondary options\n"
+        "**Max VP:** 100 per game"
+    )
+    embed.add_field(name="⚔️  Scoring", value=scoring, inline=False)
+    embed.set_footer(text="Pinned  ·  Refer to the current matched play rules pack for full details")
+    return embed
 
 def vp_bar(vp: int, max_vp: int = 120, width: int = 10) -> str:
     """Unicode VP progress bar.
@@ -216,35 +316,52 @@ def build_team_standings_embed(event: dict, standings: List[dict], final: bool =
         embed.set_footer(text="Tournament complete")
     return embed
 
-def build_list_review_header(event: dict, regs: List[dict]) -> discord.Embed:
-    submitted = [r for r in regs if r["list_text"]]
-    missing   = [r for r in regs if not r["list_text"]]
-    checklist = (
-        "\n".join(f"✅  {fe(r['army'])} **{r['player_username']}** — *{r['army']}*" for r in submitted) +
-        ("\n" if missing else "") +
-        "\n".join(f"⏳  {r['player_username']}" for r in missing)
-    )
+def build_list_review_header(event: dict, regs: list) -> discord.Embed:
+    """
+    Header card for the Army Lists thread.
+    Submission checklist — submitted vs missing.
+    """
+    submitted = [r for r in regs if r.get("list_text")]
+    missing   = [r for r in regs if not r.get("list_text")]
+
+    lines = []
+    for r in submitted:
+        lines.append(f"✅  {fe(r['army'])} **{r['player_username']}**")
+    for r in missing:
+        lines.append(f"⏳  **{r['player_username']}** — *list not submitted*")
+
     embed = discord.Embed(
         title=f"📋  Army Lists  —  {event['name']}",
-        description=f"{SEP}\n{checklist}\n{SEP}",
+        description="\n".join(lines) or "*No registrations found.*",
         color=COLOUR_GOLD,
     )
     embed.add_field(name="✅  Submitted", value=str(len(submitted)), inline=True)
     embed.add_field(name="⏳  Missing",   value=str(len(missing)),   inline=True)
-    embed.set_footer(text="Lists published 24h before the event  ·  Scroll down for individual lists")
+    embed.set_footer(text="Individual lists follow below  ·  Scroll down to review")
     return embed
 
 def build_player_list_embed(reg: dict, index: int) -> discord.Embed:
-    army  = reg["army"]
-    det   = reg["detachment"]
-    emoji = fe(army)
-    colour = faction_colour(army)
+    """
+    Individual army list card in the Army Lists thread.
+    Long names are handled — embed title truncates gracefully,
+    full name shown inside the description.
+    """
+    army      = reg["army"]
+    det       = reg["detachment"]
+    emoji     = fe(army)
+    colour    = faction_colour(army)
+    full_name = reg["player_username"]
+    # Truncate only the embed title (Discord limit 256), keep full name in body
+    title_name = full_name[:50] + ("…" if len(full_name) > 50 else "")
+
     list_text = reg.get("list_text") or "*No list submitted*"
+    # Discord field value limit is 1024 chars
     if len(list_text) > 950:
-        list_text = list_text[:950] + "\n*[Truncated — contact player for full list]*"
+        list_text = list_text[:950] + "\n*[truncated — contact player for full list]*"
+
     embed = discord.Embed(
-        title=f"{emoji}  {reg['player_username']}",
-        description=f"**{army}**  ·  *{det}*",
+        title=f"{emoji}  {title_name}",
+        description=f"**{full_name}**\n{army}  ·  *{det}*",
         color=colour,
     )
     embed.add_field(name="📜  Army List", value=f"```\n{list_text}\n```", inline=False)
