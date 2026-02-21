@@ -6,6 +6,8 @@ Background service coroutines and autocomplete helpers.
 Functions:
   • refresh_spectator_dashboard
   • log_immediate
+  • standings card refresh
+  • refresh_standings_card()
   • Autocomplete: ac_active_events, ac_all_events, ac_missions,
                   ac_armies, ac_detachments, ac_pending_regs,
                   ac_approved_regs, ac_active_games, ac_complete_games
@@ -19,6 +21,7 @@ from config import WHATS_PLAYING_ID, EVENT_NOTICEBOARD_ID, WARHAMMER_ARMIES, TOU
 from state import get_thread_reg, GS, RS
 from database import *
 from embeds import build_spectator_dashboard_embed, build_judge_queue_embed
+from refresh_dashboards task
 
 # ══════════════════════════════════════════════════════════════════════════════
 # DASHBOARD REFRESH HELPERS
@@ -53,6 +56,40 @@ async def log_immediate(bot, title: str, description: str, color: discord.Color 
         await ch.send(embed=embed)
     except Exception as e:
         print(f"⚠️ Immediate log failed: {e}")
+
+async def refresh_standings_card(bot, event_id: str):
+    """
+    Refresh the pinned Standings card in #event-noticeboard.
+    Called from the refresh_dashboards background task alongside
+    refresh_spectator_dashboard and _refresh_judges_on_duty.
+    """
+    from state import get_thread_reg
+    from embeds import build_standings_embed
+    from database import db_get_event, db_get_standings
+
+    event = db_get_event(event_id)
+    if not event:
+        return
+
+    ch = bot.get_channel(EVENT_NOTICEBOARD_ID)
+    if not ch:
+        return
+
+    reg = get_thread_reg(event_id)
+    msg_id = reg.get("standings_msg_id") or (
+        int(event["standings_msg_id"]) if event.get("standings_msg_id") else None
+    )
+    if not msg_id:
+        return
+
+    standings = db_get_standings(event_id)
+    embed     = build_standings_embed(event, standings)
+
+    try:
+        msg = await ch.fetch_message(int(msg_id))
+        await msg.edit(embed=embed)
+    except (discord.NotFound, discord.HTTPException):
+        pass   # Card was deleted — admin will re-pin manually
 
 # ══════════════════════════════════════════════════════════════════════════════
 # AUTOCOMPLETE FUNCTIONS
