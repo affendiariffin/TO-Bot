@@ -16,7 +16,7 @@ from config import TOKEN, GUILD, GUILD_ID, LOG_BATCH_MINUTES, BOT_LOGS_ID
 from database import init_db, db_flush_logs, db_get_active_events, db_get_current_round
 from state import get_thread_reg
 from threads import restore_thread_registry
-from services import refresh_spectator_dashboard, _refresh_judge_queue, log_immediate
+from from services import refresh_spectator_dashboard, _refresh_judges_on_duty, log_immediate
 
 # ── Command modules ───────────────────────────────────────────────────────────
 import commands_event
@@ -102,8 +102,11 @@ async def check_round_deadlines():
 
 @tasks.loop(minutes=5)
 async def refresh_dashboards():
+    guild = bot.get_guild(GUILD_ID)
     for event in db_get_active_events():
         await refresh_spectator_dashboard(bot, event["event_id"])
+        if guild:
+            await _refresh_judges_on_duty(bot, event["event_id"], guild)
 
 @flush_batch_logs.before_loop
 @check_round_deadlines.before_loop
@@ -136,6 +139,38 @@ async def on_ready():
 @bot.event
 async def on_member_join(member: discord.Member):
     pass   # extend as needed
+
+@bot.event
+async def on_voice_state_update(
+    member: discord.Member,
+    before: discord.VoiceState,
+    after:  discord.VoiceState,
+):
+    """
+    Refresh the Judges on Duty card whenever a crew member or admin
+    moves into or out of a Game Room voice channel.
+    """
+    from config import CREW_ROLE_ID, GAME_ROOM_PREFIX
+    from state  import get_thread_reg
+
+    # Only care about crew / admins
+    is_crew = (
+        member.guild_permissions.administrator
+        or (CREW_ROLE_ID and any(r.id == CREW_ROLE_ID for r in member.roles))
+    )
+    if not is_crew:
+        return
+
+    # Only care if the channel change involves a Game Room
+    def _is_game_room(vc: discord.VoiceState | None) -> bool:
+        return bool(vc and vc.channel and vc.channel.name.startswith(GAME_ROOM_PREFIX))
+
+    if not (_is_game_room(before) or _is_game_room(after)):
+        return
+
+    # Refresh for every active event (typically just one at a time)
+    for event in db_get_active_events():
+        await _refresh_judges_on_duty(bot, event["event_id"], member.guild)
 
 @tree.error
 async def on_error(interaction: discord.Interaction,
