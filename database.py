@@ -14,6 +14,7 @@ Sections:
   • Log queue
   • Teams, team members, team rounds, team pairings, pairing state
   • Scorebot integration
+  • Standings_msg_id column
 
 Imported by: threads.py, views.py, services.py, commands_*.py, ritual.py
 """
@@ -292,7 +293,8 @@ def init_db():
             """)
 
             conn.commit()
-    print("✅ Tournament DB ready")
+    
+  print("✅ Tournament DB ready")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # DATABASE HELPERS
