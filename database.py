@@ -186,6 +186,7 @@ def init_db():
                 "individual_points INTEGER DEFAULT 2000",
                 "captains_thread_id TEXT",
                 "pairing_room_thread_id TEXT",
+                "standings_msg_id TEXT",   # FIX: added missing column used by refresh_standings_card
             ):
                 cur.execute(f"ALTER TABLE tournament_events ADD COLUMN IF NOT EXISTS {col_def}")
 
