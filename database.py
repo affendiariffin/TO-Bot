@@ -870,3 +870,68 @@ def scorebot_bulk_submit(eid: str, games: List[dict]) -> int:
             conn.commit()
     return submitted
 
+def db_get_results_by_player(event_id: str) -> dict:
+    """
+    Returns {player_id: {round_number: "W" | "L" | "D" | None}}
+    for every player in the event, across every round.
+
+    "W" = win (including bye)
+    "L" = loss
+    "D" = draw
+    None = game exists but result not yet confirmed (pending/submitted state)
+
+    Used by the standings table to render per-round colour dots.
+    """
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                SELECT
+                    g.player1_id,
+                    g.player2_id,
+                    g.player1_vp,
+                    g.player2_vp,
+                    g.state,
+                    g.is_bye,
+                    r.round_number
+                FROM tournament_games g
+                JOIN tournament_rounds r ON g.round_id = r.round_id
+                WHERE g.event_id = %s
+                ORDER BY r.round_number
+            """, (event_id,))
+            rows = cur.fetchall()
+
+    # {player_id: {round_num: "W"/"L"/"D"/None}}
+    results: dict = {}
+
+    for row in rows:
+        rn  = row["round_number"]
+        p1  = row["player1_id"]
+        p2  = row["player2_id"]
+        vp1 = row["player1_vp"]
+        vp2 = row["player2_vp"]
+        st  = row["state"]
+
+        # Bye round — player 1 always wins
+        if row["is_bye"]:
+            if p1:
+                results.setdefault(p1, {})[rn] = "W"
+            continue
+
+        # Confirmed result
+        if st == "complete" and vp1 is not None and vp2 is not None:
+            if vp1 > vp2:
+                r1, r2 = "W", "L"
+            elif vp2 > vp1:
+                r1, r2 = "L", "W"
+            else:
+                r1 = r2 = "D"
+        else:
+            # Game exists but not yet confirmed — show nothing (dot stays ➖)
+            r1 = r2 = None
+
+        if p1:
+            results.setdefault(p1, {})[rn] = r1
+        if p2:
+            results.setdefault(p2, {})[rn] = r2
+
+    return results
