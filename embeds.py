@@ -13,16 +13,16 @@ Functions:
   • build_list_review_header
   • build_player_list_embed
   • build_judges_on_duty_embed
-  • build_standings_embed
+  • build_spectator_dashboard_embed
   • build_event_main_embed
   • build_schedule_embed
   • build_missions_embed
 
-
 Imported by: services.py, views.py, commands_*.py
 """
 import discord
-from datetime import datetime
+import math
+from datetime import datetime, timedelta
 from typing import List, Optional
 from config import (COLOUR_GOLD, COLOUR_CRIMSON, COLOUR_AMBER, COLOUR_SLATE,
                     SEP, GAME_ROOM_PREFIX, TOURNAMENT_MISSIONS,
@@ -30,6 +30,80 @@ from config import (COLOUR_GOLD, COLOUR_CRIMSON, COLOUR_AMBER, COLOUR_SLATE,
 from state import GS, RndS, JCS, FMT, get_judges_for_guild
 from database import db_get_rounds
 from threads import calculate_rounds
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def vp_bar(vp: int, max_vp: int = 120, width: int = 10) -> str:
+    """Unicode VP progress bar.
+    e.g. vp_bar(85) → ▓▓▓▓▓▓▓░░░  85 VP"""
+    if not max_vp:
+        return ""
+    filled = round((vp / max_vp) * width)
+    filled = max(0, min(width, filled))
+    return f"{'▓' * filled}{'░' * (width - filled)}  {vp}"
+
+def _round_slot(round_data: dict | None) -> str:
+    """
+    Raw slot string before right-justification.
+    Max 4 chars: "100W", "100L", "100D".
+    "-" only for a game that existed in a completed round but has no confirmed result.
+    """
+    if not round_data or round_data["vp"] is None:
+        return "-"
+    vp     = round_data["vp"]
+    result = round_data.get("result") or ""
+    suffix = result if result in ("W", "L", "D") else ""
+    return f"{vp}{suffix}"
+
+def _standings_table(
+    standings: List[dict],
+    done_rounds: int,
+    player_results: dict,
+    include_totals: bool = False,
+) -> str:
+    """
+    Monospace standings table in a code block.
+    Renders exactly done_rounds slot columns — never more.
+    """
+    if not standings:
+        return "*No results yet.*"
+
+    # Pre-event or between Round 1 — just show roster order
+    if done_rounds == 0:
+        return "```\n" + "\n".join(
+            f"{(str(i) + '.').rjust(3)} {s['player_username'][:18]}"
+            for i, s in enumerate(standings, 1)
+        ) + "\n```"
+
+    SLOT_W   = 4   # "100W" is the widest possible value
+    max_name = max((len(s["player_username"]) for s in standings), default=8)
+    name_w   = min(max_name, 18)
+
+    lines = []
+    for i, s in enumerate(standings, 1):
+        pid  = s["player_id"]
+        pos  = f"{i}.".rjust(3)
+        name = s["player_username"][:name_w].ljust(name_w)
+
+        pr    = player_results.get(pid, {})
+        slots = [
+            _round_slot(pr.get(rn)).rjust(SLOT_W)
+            for rn in range(1, done_rounds + 1)
+        ]
+        score_str = " / ".join(slots)
+
+        if include_totals:
+            vp_tot = s.get("vp_total", 0)
+            vdiff  = s.get("vp_diff", 0)
+            totals = f"  {vp_tot:>3}VP ({vdiff:>+4})"
+        else:
+            totals = ""
+
+        lines.append(f"{pos} {name}  {score_str}{totals}")
+
+    return "```\n" + "\n".join(lines) + "\n```"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # EMBED BUILDERS  —  TV-bot design language
@@ -41,7 +115,6 @@ def build_event_main_embed(event: dict, regs: list) -> discord.Embed:
     Pinned by admin in #event-noticeboard.
     Shows core event info + current player roster.
     """
-    from threads import calculate_rounds
     m           = TOURNAMENT_MISSIONS.get(event["mission_code"], {})
     sd, ed      = event["start_date"], event["end_date"]
     multi       = sd != ed
@@ -74,14 +147,12 @@ def build_event_main_embed(event: dict, regs: list) -> discord.Embed:
     embed.set_footer(text="Pinned  ·  Updated by crew as registrations are confirmed")
     return embed
 
-
 def build_schedule_embed(event: dict) -> discord.Embed:
     """
     Card 2 — Schedule.
     Pinned by admin. Shows day/round breakdown and key times.
     Admin edits the message manually if times change.
     """
-    from threads import calculate_rounds
     total_rounds = calculate_rounds(event["max_players"])
     rpd          = event["rounds_per_day"]
     days         = math.ceil(total_rounds / rpd)
@@ -107,7 +178,6 @@ def build_schedule_embed(event: dict) -> discord.Embed:
     embed.set_footer(text="Pinned  ·  All times in UTC  ·  Check #event-noticeboard for round updates")
     return embed
 
-
 def build_missions_embed(event: dict) -> discord.Embed:
     """
     Card 3 — Missions.
@@ -131,15 +201,6 @@ def build_missions_embed(event: dict) -> discord.Embed:
     embed.add_field(name="⚔️  Scoring", value=scoring, inline=False)
     embed.set_footer(text="Pinned  ·  Refer to the current matched play rules pack for full details")
     return embed
-
-def vp_bar(vp: int, max_vp: int = 120, width: int = 10) -> str:
-    """Unicode VP progress bar.
-    e.g. vp_bar(85) → ▓▓▓▓▓▓▓░░░  85 VP"""
-    if not max_vp:
-        return ""
-    filled = round((vp / max_vp) * width)
-    filled = max(0, min(width, filled))
-    return f"{'▓' * filled}{'░' * (width - filled)}  {vp}"
 
 def build_event_announcement_embed(event: dict) -> discord.Embed:
     m = TOURNAMENT_MISSIONS.get(event["mission_code"], {})
@@ -253,32 +314,93 @@ def build_pairings_embed(event: dict, round_obj: dict, games: List[dict], guild:
     embed.set_footer(text="Use the buttons below to submit results or call a judge  ·  Buttons are per-game")
     return embed
 
+def build_spectator_dashboard_embed(
+    event: dict,
+    round_obj: Optional[dict],
+    games: List[dict],
+    standings: List[dict],
+    guild: discord.Guild,
+) -> discord.Embed:
+    """
+    Pinned card in #what's-playing-now.
+    Shows round status + VP standings for completed rounds only.
+    """
+    from database import db_get_results_by_player
+
+    live   = bool(round_obj and round_obj["state"] == RndS.IN_PROGRESS)
+    colour = COLOUR_CRIMSON if live else COLOUR_GOLD
+
+    rounds       = db_get_rounds(event["event_id"])
+    done_rounds  = sum(1 for r in rounds if r["state"] == RndS.COMPLETE)
+    total_rounds = calculate_rounds(event["max_players"])
+
+    # ── Title + status ────────────────────────────────────────────────────
+    if round_obj:
+        rnum = round_obj["round_number"]
+        if live:
+            deadline = round_obj.get("deadline_at")
+            status   = f"⏱️  Round ends {ts(deadline)}" if deadline else "🔴  In progress"
+        else:
+            status = "⏸️  Between rounds"
+        title = f"{'🔴 LIVE' if live else '📊'}  {event['name']}  —  Round {rnum}"
+    else:
+        status = "*Waiting for first round*"
+        title  = f"🏆  {event['name']}"
+
+    embed = discord.Embed(title=title, description=status, color=colour)
+
+    # ── Standings ─────────────────────────────────────────────────────────
+    field_name = (
+        f"📊  Standings  (after Round {done_rounds} of {total_rounds})"
+        if done_rounds else "📊  Standings"
+    )
+    if standings:
+        player_results = db_get_results_by_player(event["event_id"])
+        table = _standings_table(standings, done_rounds, player_results)
+        embed.add_field(name=field_name, value=table, inline=False)
+    else:
+        embed.add_field(name=field_name, value="*No results yet.*", inline=False)
+
+    # ── Footer ────────────────────────────────────────────────────────────
+    parts = []
+    if done_rounds > 0:
+        parts.append(f"After Round {done_rounds}")
+    parts.append(f"Last updated {datetime.utcnow().strftime('%H:%M')} UTC")
+    embed.set_footer(text="  ·  ".join(parts))
+
+    return embed
+
 def build_standings_embed(event: dict, standings: List[dict], final: bool = False) -> discord.Embed:
-    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    """
+    /standings command embed — completed rounds only, with total VP and VP diff.
+    """
+    from database import db_get_results_by_player
+
     title  = f"🏆  Final Standings — {event['name']}" if final else f"📊  Standings — {event['name']}"
     colour = COLOUR_GOLD if final else COLOUR_SLATE
 
     if not standings:
         return discord.Embed(title=title, description="No results yet.", color=colour)
 
-    header = f"{'':3} {'Player':<20} {'Army':<18} {'W':>2} {'L':>2} {'VP+':>5} {'Δ':>5}"
-    sep_   = "─" * len(header)
-    lines  = [f"```", header, sep_]
-    for i, s in enumerate(standings, 1):
-        m    = medals.get(i, f"  {i}.")
-        name = s["player_username"][:18]
-        army = s["army"][:16]
-        lines.append(f"{m:<3} {name:<20} {army:<18} {s['wins']:>2} {s['losses']:>2} {s['vp_total']:>5} {s['vp_diff']:>+5}")
-    lines.append("```")
+    rounds       = db_get_rounds(event["event_id"])
+    done_rounds  = sum(1 for r in rounds if r["state"] == RndS.COMPLETE)
+    total_rounds = calculate_rounds(event["max_players"])
+    p_results    = db_get_results_by_player(event["event_id"])
 
-    embed = discord.Embed(title=title, description="\n".join(lines), color=colour)
+    table = _standings_table(standings, done_rounds, p_results, include_totals=True)
+    embed = discord.Embed(title=title, description=table, color=colour)
+
     if not final:
-        rounds = db_get_rounds(event["event_id"])
-        done   = sum(1 for r in rounds if r["state"] == RndS.COMPLETE)
-        total  = calculate_rounds(event["max_players"])
-        embed.set_footer(text=f"Round {done}/{total}  ·  Tiebreaker: VP differential  ·  Updated {datetime.utcnow().strftime('%H:%M')} UTC")
+        embed.set_footer(
+            text=(
+                f"Round {done_rounds}/{total_rounds}  ·  "
+                f"Format: VP + W/L/D per completed round  ·  "
+                f"Last updated {datetime.utcnow().strftime('%H:%M')} UTC"
+            )
+        )
     else:
         embed.set_footer(text="Tournament complete  ·  Results submitted to Scorebot for ELO calculation")
+
     return embed
 
 def build_team_standings_embed(event: dict, standings: List[dict], final: bool = False) -> discord.Embed:
@@ -383,7 +505,6 @@ def build_judges_on_duty_embed(
     Players should DM a 🟢 available judge directly.
     VP adjustments applied by crew via /result adjust after the round.
     """
-    from state import get_judges_for_guild
     judges    = get_judges_for_guild(guild)
     available = [j for j in judges if j["available"]]
     in_game   = [j for j in judges if not j["available"]]
@@ -438,159 +559,5 @@ def build_judges_on_duty_embed(
         parts.append(f"Round {round_obj['round_number']}")
     parts.append(f"Last updated {datetime.utcnow().strftime('%H:%M')} UTC")
     embed.set_footer(text="  ·  ".join(parts))
-
-    return embed
-def _round_slot(round_data: dict | None) -> str:
-    """
-    Raw slot string before right-justification.
-    Max 4 chars: "100W", "100L", "100D".
-    "-" only for a game that existed in a completed round but has no confirmed result.
-    """
-    if not round_data or round_data["vp"] is None:
-        return "-"
-    vp     = round_data["vp"]
-    result = round_data.get("result") or ""
-    suffix = result if result in ("W", "L", "D") else ""
-    return f"{vp}{suffix}"
-
-
-def _standings_table(
-    standings: List[dict],
-    done_rounds: int,
-    player_results: dict,
-    include_totals: bool = False,
-) -> str:
-    """
-    Monospace standings table in a code block.
-    Renders exactly done_rounds slot columns — never more.
-    """
-    if not standings:
-        return "*No results yet.*"
-
-    # Pre-event or between Round 1 — just show roster order
-    if done_rounds == 0:
-        return "```\n" + "\n".join(
-            f"{(str(i) + '.').rjust(3)} {s['player_username'][:18]}"
-            for i, s in enumerate(standings, 1)
-        ) + "\n```"
-
-    SLOT_W   = 4   # "100W" is the widest possible value
-    max_name = max((len(s["player_username"]) for s in standings), default=8)
-    name_w   = min(max_name, 18)
-
-    lines = []
-    for i, s in enumerate(standings, 1):
-        pid  = s["player_id"]
-        pos  = f"{i}.".rjust(3)
-        name = s["player_username"][:name_w].ljust(name_w)
-
-        pr    = player_results.get(pid, {})
-        slots = [
-            _round_slot(pr.get(rn)).rjust(SLOT_W)
-            for rn in range(1, done_rounds + 1)
-        ]
-        score_str = " / ".join(slots)
-
-        if include_totals:
-            vp_tot = s.get("vp_total", 0)
-            vdiff  = s.get("vp_diff", 0)
-            totals = f"  {vp_tot:>3}VP ({vdiff:>+4})"
-        else:
-            totals = ""
-
-        lines.append(f"{pos} {name}  {score_str}{totals}")
-
-    return "```\n" + "\n".join(lines) + "\n```"
-
-
-def build_spectator_dashboard_embed(
-    event: dict,
-    round_obj: Optional[dict],
-    games: List[dict],
-    standings: List[dict],
-    guild: discord.Guild,
-) -> discord.Embed:
-    """
-    Pinned card in #what's-playing-now.
-    Shows round status + VP standings for completed rounds only.
-    """
-    from database import db_get_results_by_player
-    from threads  import calculate_rounds
-
-    live   = bool(round_obj and round_obj["state"] == RndS.IN_PROGRESS)
-    colour = COLOUR_CRIMSON if live else COLOUR_GOLD
-
-    rounds       = db_get_rounds(event["event_id"])
-    done_rounds  = sum(1 for r in rounds if r["state"] == RndS.COMPLETE)
-    total_rounds = calculate_rounds(event["max_players"])
-
-    # ── Title + status ────────────────────────────────────────────────────
-    if round_obj:
-        rnum = round_obj["round_number"]
-        if live:
-            deadline = round_obj.get("deadline_at")
-            status   = f"⏱️  Round ends {ts(deadline)}" if deadline else "🔴  In progress"
-        else:
-            status = "⏸️  Between rounds"
-        title = f"{'🔴 LIVE' if live else '📊'}  {event['name']}  —  Round {rnum}"
-    else:
-        status = "*Waiting for first round*"
-        title  = f"🏆  {event['name']}"
-
-    embed = discord.Embed(title=title, description=status, color=colour)
-
-    # ── Standings ─────────────────────────────────────────────────────────
-    field_name = (
-        f"📊  Standings  (after Round {done_rounds} of {total_rounds})"
-        if done_rounds else "📊  Standings"
-    )
-    if standings:
-        player_results = db_get_results_by_player(event["event_id"])
-        table = _standings_table(standings, done_rounds, player_results)
-        embed.add_field(name=field_name, value=table, inline=False)
-    else:
-        embed.add_field(name=field_name, value="*No results yet.*", inline=False)
-
-    # ── Footer ────────────────────────────────────────────────────────────
-    parts = []
-    if done_rounds > 0:
-        parts.append(f"After Round {done_rounds}")
-    parts.append(f"Last updated {datetime.utcnow().strftime('%H:%M')} UTC")
-    embed.set_footer(text="  ·  ".join(parts))
-
-    return embed
-
-
-def build_standings_embed(event: dict, standings: List[dict], final: bool = False) -> discord.Embed:
-    """
-    /standings command embed — completed rounds only, with total VP and VP diff.
-    """
-    from database import db_get_results_by_player
-    from threads  import calculate_rounds
-
-    title  = f"🏆  Final Standings — {event['name']}" if final else f"📊  Standings — {event['name']}"
-    colour = COLOUR_GOLD if final else COLOUR_SLATE
-
-    if not standings:
-        return discord.Embed(title=title, description="No results yet.", color=colour)
-
-    rounds       = db_get_rounds(event["event_id"])
-    done_rounds  = sum(1 for r in rounds if r["state"] == RndS.COMPLETE)
-    total_rounds = calculate_rounds(event["max_players"])
-    p_results    = db_get_results_by_player(event["event_id"])
-
-    table = _standings_table(standings, done_rounds, p_results, include_totals=True)
-    embed = discord.Embed(title=title, description=table, color=colour)
-
-    if not final:
-        embed.set_footer(
-            text=(
-                f"Round {done_rounds}/{total_rounds}  ·  "
-                f"Format: VP + W/L/D per completed round  ·  "
-                f"Last updated {datetime.utcnow().strftime('%H:%M')} UTC"
-            )
-        )
-    else:
-        embed.set_footer(text="Tournament complete  ·  Results submitted to Scorebot for ELO calculation")
 
     return embed
