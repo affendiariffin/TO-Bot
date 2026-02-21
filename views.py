@@ -33,7 +33,6 @@ from config import (COLOUR_GOLD, COLOUR_CRIMSON, COLOUR_AMBER, COLOUR_SLATE,
                     TOURNAMENT_MISSIONS, fe, room_colour)
 from state import GS, RS, JCS, ES, is_to, get_thread_reg, get_judges_for_guild
 from database import *
-from embeds import build_judge_queue_embed
 from threads import ensure_submissions_thread, calculate_rounds
 
 # Lazy imports to avoid circular dependencies (services imports from views)
@@ -41,9 +40,9 @@ def _get_refresh_spectator_dashboard():
     from services import refresh_spectator_dashboard
     return refresh_spectator_dashboard
 
-def _get_refresh_judge_queue():
-    from services import _refresh_judge_queue
-    return _refresh_judge_queue
+def _get_refresh_judges_on_duty():
+    from services import _refresh_judges_on_duty
+    return _refresh_judges_on_duty
 
 def _get_log_immediate():
     from services import log_immediate
@@ -52,8 +51,8 @@ def _get_log_immediate():
 async def refresh_spectator_dashboard(bot, event_id):
     return await _get_refresh_spectator_dashboard()(bot, event_id)
 
-async def _refresh_judge_queue(bot, event_id, guild):
-    return await _get_refresh_judge_queue()(bot, event_id, guild)
+async def _refresh_judges_on_duty(bot, event_id, guild):
+    return await _get_refresh_judges_on_duty()(bot, event_id, guild)
 
 async def log_immediate(bot, title, description, colour=None):
     return await _get_log_immediate()(bot, title, description, colour)
@@ -202,7 +201,7 @@ class PairingActionView(ui.View):
                      self.event_id, level="judge")
 
         # Update judge queue embed
-        await _refresh_judge_queue(interaction.client, self.event_id, interaction.guild)
+        await _refresh_judges_on_duty(interaction.client, self.event_id, interaction.guild)
 
         # Ping judges in noticeboard
         open_calls = db_get_open_calls(self.event_id)
@@ -306,7 +305,7 @@ class JudgeQueueView(ui.View):
                 f"Judge {judge_name} acknowledged call {call_id} — Room {call['room_number']}",
                 self.event_id
             )
-            await _refresh_judge_queue(interaction.client, self.event_id, interaction.guild)
+            await _refresh_judges_on_duty(interaction.client, self.event_id, interaction.guild)
 
             # Notify the room
             ch = interaction.guild.get_channel(EVENT_NOTICEBOARD_ID)
@@ -680,7 +679,7 @@ class JudgeCloseModal(ui.Modal, title="Close Judge Call"):
                 f"Use `/result adjust` to apply the VP change to standings.",
                 COLOUR_AMBER)
 
-        await _refresh_judge_queue(self.bot_ref, self.event_id, self.guild)
+        await _refresh_judges_on_duty(self.bot_ref, self.event_id, self.guild)
         await interaction.response.send_message(
             f"✅ Call `{self.call_id}` closed."
             + (f"\n📝 Adjustment noted: *{adj}*\nApply with `/result adjust` if needed." if adj else ""),
