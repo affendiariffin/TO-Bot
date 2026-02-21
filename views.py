@@ -25,14 +25,38 @@ Imported by: services.py, commands_*.py
 import discord
 from discord import ui
 import asyncio
+import psycopg2.extras
 from datetime import datetime, timezone
 from typing import Optional
 from config import (COLOUR_GOLD, COLOUR_CRIMSON, COLOUR_AMBER, COLOUR_SLATE,
-                    CREW_ROLE_ID, EVENT_NOTICEBOARD_ID)
-from state import GS, RS, JCS, ES, get_thread_reg
+                    CREW_ROLE_ID, EVENT_NOTICEBOARD_ID,
+                    TOURNAMENT_MISSIONS, fe, room_colour)
+from state import GS, RS, JCS, ES, is_to, get_thread_reg, get_judges_for_guild
 from database import *
 from embeds import build_judge_queue_embed
-from threads import ensure_submissions_thread
+from threads import ensure_submissions_thread, calculate_rounds
+
+# Lazy imports to avoid circular dependencies (services imports from views)
+def _get_refresh_spectator_dashboard():
+    from services import refresh_spectator_dashboard
+    return refresh_spectator_dashboard
+
+def _get_refresh_judge_queue():
+    from services import _refresh_judge_queue
+    return _refresh_judge_queue
+
+def _get_log_immediate():
+    from services import log_immediate
+    return log_immediate
+
+async def refresh_spectator_dashboard(bot, event_id):
+    return await _get_refresh_spectator_dashboard()(bot, event_id)
+
+async def _refresh_judge_queue(bot, event_id, guild):
+    return await _get_refresh_judge_queue()(bot, event_id, guild)
+
+async def log_immediate(bot, title, description, colour=None):
+    return await _get_log_immediate()(bot, title, description, colour)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # VIEWS & BUTTONS
@@ -87,9 +111,6 @@ class RegistrationApprovalView(ui.View):
         super().__init__(timeout=None)
         self.event_id  = event_id
         self.player_id = player_id
-        # Encode IDs into custom_ids
-        self._approve_id = f"btn_approve_{event_id}_{player_id}"
-        self._reject_id  = f"btn_reject_{event_id}_{player_id}"
 
     @ui.button(label="✅  Approve", style=discord.ButtonStyle.success)
     async def btn_approve(self, interaction: discord.Interaction, button: ui.Button):
@@ -188,13 +209,13 @@ class PairingActionView(ui.View):
         queue_pos  = len(open_calls)
         ch = interaction.guild.get_channel(EVENT_NOTICEBOARD_ID)
         if ch:
-            busy_judges = [
-                j for j in get_judges_for_guild(interaction.guild, self.event_id)
-                if j.get("call_id")
-            ]
+            # FIX: get_judges_for_guild takes only guild; availability derived from voice state
+            all_judges  = get_judges_for_guild(interaction.guild)
+            busy_judges = [j for j in all_judges if not j.get("available")]
+            available   = [j for j in all_judges if j.get("available")]
             busy_note = (
                 f"\n⚠️ All judges currently busy — you are #{queue_pos} in queue."
-                if busy_judges and queue_pos > len(busy_judges) else ""
+                if busy_judges and not available else ""
             )
             # Mention Crew role if configured, otherwise @here
             role_mention = f"<@&{CREW_ROLE_ID}>" if CREW_ROLE_ID else "@here"
@@ -223,7 +244,7 @@ class JudgeQueueView(ui.View):
     Any judge (Crew/admin) can acknowledge any open call — first click wins.
     Each acknowledged call shows a Close button only to the claiming judge or any admin.
     """
-    def __init__(self, event_id: str, calls: List[dict]):
+    def __init__(self, event_id: str, calls: list):
         super().__init__(timeout=None)
         self.event_id = event_id
 
@@ -278,7 +299,8 @@ class JudgeQueueView(ui.View):
                 "acknowledged_by_id":  judge_id,
                 "acknowledged_by_name": judge_name,
             })
-            judge_take_call(self.event_id, judge_id, judge_name, call_id, call["room_number"])
+            # NOTE: judge_take_call() removed — availability derived from voice channel state,
+            # not tracked in memory. DB update above is the source of truth.
 
             db_queue_log(
                 f"Judge {judge_name} acknowledged call {call_id} — Room {call['room_number']}",
@@ -407,6 +429,7 @@ class ListSubmissionModal(ui.Modal, title="Submit Army List"):
         # Fallback: noticeboard channel
         target = sub_thread or interaction.guild.get_channel(EVENT_NOTICEBOARD_ID)
         if target:
+            from config import faction_colour
             embed = discord.Embed(
                 title=f"📋  List Submitted — {interaction.user.display_name}",
                 description=(
@@ -488,7 +511,7 @@ class ResultModal(ui.Modal, title="Submit Game Result"):
                 value=f"{fe(game['player1_army'])} *{game['player1_army']}*",
                 inline=True,
             )
-            embed.add_field(name="​", value=f"**{p1_vp} — {p2_vp}**", inline=True)
+            embed.add_field(name="\u200b", value=f"**{p1_vp} — {p2_vp}**", inline=True)
             embed.add_field(
                 name=f"🔴 {game['player2_username']}",
                 value=f"{fe(game['player2_army'])} *{game['player2_army']}*",
@@ -635,14 +658,14 @@ class JudgeCloseModal(ui.Modal, title="Close Judge Call"):
         judge_id   = str(interaction.user.id)
         judge_name = interaction.user.display_name
         db_update_judge_call(self.call_id, {
-            "state":         JCS.CLOSED,
-            "closed_at":     datetime.utcnow(),
-            "closed_by_id":  judge_id,
+            "state":          JCS.CLOSED,
+            "closed_at":      datetime.utcnow(),
+            "closed_by_id":   judge_id,
             "closed_by_name": judge_name,
-            "vp_adjustment": adj,
+            "vp_adjustment":  adj,
         })
-        # Release judge from in-memory roster
-        judge_release_call(self.event_id, judge_id)
+        # NOTE: judge_release_call() removed — availability derived from voice channel state,
+        # not tracked in memory. DB update above is the source of truth.
 
         db_queue_log(
             f"Judge {judge_name} closed call {self.call_id}"
@@ -689,10 +712,10 @@ async def _confirm_game(bot, game_id: str, message: discord.Message, guild: disc
         color=col,
     )
     embed.add_field(name=f"🔵 {game['player1_username']}", value=f"{fe(game['player1_army'])}", inline=True)
-    embed.add_field(name="​", value=f"**{p1_vp} — {p2_vp}**", inline=True)
+    embed.add_field(name="\u200b", value=f"**{p1_vp} — {p2_vp}**", inline=True)
     embed.add_field(name=f"🔴 {game['player2_username']}", value=f"{fe(game['player2_army'])}", inline=True)
     embed.add_field(name="🏆  Winner", value=f"**{winner_name}**", inline=False)
-    embed.set_footer(text=f"Confirmed  ·  Results held until event closes, then submitted to Scorebot")
+    embed.set_footer(text="Confirmed  ·  Results held until event closes, then submitted to Scorebot")
 
     await message.edit(embed=embed, view=None)
     db_queue_log(
@@ -707,4 +730,3 @@ async def _auto_confirm_after_24h(bot, game_id: str, message: discord.Message, g
     game = db_get_game(game_id)
     if game and game["state"] == GS.SUBMITTED:
         await _confirm_game(bot, game_id, message, guild)
-
