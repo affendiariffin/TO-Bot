@@ -20,7 +20,7 @@ Imported by: threads.py, views.py, services.py, commands_*.py, ritual.py
 """
 import psycopg2, psycopg2.extras
 import uuid
-from datetime import datetime
+from datetime import datetime, date  # FIX: added `date` (used in scorebot_get_season_id)
 from typing import List, Optional, Dict
 from config import DATABASE_URL
 
@@ -293,8 +293,7 @@ def init_db():
             """)
 
             conn.commit()
-    
-  print("✅ Tournament DB ready")
+    print("✅ Tournament DB ready")  # FIX: corrected indentation (was 2 spaces, causing IndentationError)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # DATABASE HELPERS
@@ -823,7 +822,7 @@ def scorebot_ensure_player(cur, pid: str, name: str):
                     (pid, name))
 
 def scorebot_get_season_id() -> Optional[int]:
-    today = date.today()
+    today = date.today()  # FIX: `date` now imported correctly
     q = (today.month - 1) // 3 + 1
     name = f"Season Q{q} {today.year}"
     with get_conn() as conn:
