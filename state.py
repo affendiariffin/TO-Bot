@@ -185,8 +185,8 @@ thread_registry: Dict[str, dict] = {}
 
 def get_thread_reg(event_id: str) -> dict:
     return thread_registry.setdefault(event_id, {
-        "submissions":  None,
-        "lists":        None,
-        "rounds":       {},
-        "judge_msg_id": None,
-    })
+        "submissions":      None,   
+        "lists":            None,   
+        "rounds":           {},     
+        "judge_msg_id":     None,   
+        "standings_msg_id": None,   
