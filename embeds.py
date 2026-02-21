@@ -13,9 +13,7 @@ Functions:
   • build_list_review_header
   • build_player_list_embed
   • build_judges_on_duty_embed
-  • _DOT
-  • _standings_table()
-  • build_spectator_dashboard_embed()
+
 
 Imported by: services.py, views.py, commands_*.py
 """
@@ -324,8 +322,19 @@ def build_judges_on_duty_embed(
     embed.set_footer(text="  ·  ".join(parts))
 
     return embed
-# ── Result dot legend ─────────────────────────────────────────────────────────
-_DOT = {"W": "🟩", "L": "🟥", "D": "🟨", None: "➖"}
+def _round_slot(round_data: dict | None) -> str:
+    """
+    Render a single round slot string.
+
+    Confirmed result:  "49L"  "81W"  "75D"
+    No result yet:     "-"
+    """
+    if not round_data or round_data["vp"] is None:
+        return "-"
+    vp  = round_data["vp"]
+    res = round_data["result"]
+    suffix = {"W": "W", "L": "L", "D": "D"}.get(res, "")
+    return f"{vp}{suffix}"
 
 
 def _standings_table(
@@ -334,36 +343,42 @@ def _standings_table(
     player_results: dict,
 ) -> str:
     """
-    Builds the standings block for the spectator dashboard.
+    Builds the standings block.
 
-    Each row format:
-      `Pos  Name            ` 🟩 🟥 🟩 ➖ ➖  `2W 1L`
+    Format per row (inside a code block for alignment):
+      Pos  Name              R1    R2    R3    R4    R5
+      🥇   FND               49L / 81W / 72W /  -  /  -
+      🥈   Alaric Daybreak   80W / 60L / 91W /  -  /  -
 
-    Name column width is dynamic: capped at 16 chars, set by the longest
-    player name in the standings. Short names are padded so scores align.
+    Slot width is fixed at 5 chars ("999W" + space padding) so scores align
+    regardless of VP value (max 10th ed VP is 100, so 3 digits + 1 letter = 4).
+    Name column is dynamic: capped at 18 chars, set by the longest name.
     """
     if not standings:
         return "*No results yet.*"
 
     max_name = max((len(s["player_username"]) for s in standings), default=8)
-    name_w   = min(max_name, 16)
+    name_w   = min(max_name, 18)
+
+    # Fixed slot width: "100W" = 4 chars, pad to 4 then add " / " separator
+    SLOT_W = 4
 
     medals = {1: "🥇", 2: "🥈", 3: "🥉"}
     lines  = []
 
     for i, s in enumerate(standings, 1):
         pid   = s["player_id"]
-        # Truncate long names, pad short ones so columns line up
         name  = s["player_username"][:name_w].ljust(name_w)
         medal = medals.get(i, f"{i:>2}.")
-        w     = s.get("wins", 0)
-        l     = s.get("losses", 0)
 
-        # Per-round colour dots — ➖ for rounds not yet played
-        pr   = player_results.get(pid, {})
-        dots = " ".join(_DOT[pr.get(rn)] for rn in range(1, total_rounds + 1))
+        pr    = player_results.get(pid, {})
+        slots = []
+        for rn in range(1, total_rounds + 1):
+            slot_str = _round_slot(pr.get(rn))
+            slots.append(slot_str.rjust(SLOT_W))
 
-        lines.append(f"`{medal} {name}` {dots}  `{w}W {l}L`")
+        score_str = " / ".join(slots)
+        lines.append(f"`{medal} {name}  {score_str}`")
 
     return "\n".join(lines)
 
@@ -371,22 +386,21 @@ def _standings_table(
 def build_spectator_dashboard_embed(
     event: dict,
     round_obj: Optional[dict],
-    games: List[dict],        # kept for API compatibility; not rendered here
+    games: List[dict],        # kept for API compatibility — not rendered here
     standings: List[dict],
     guild: discord.Guild,
 ) -> discord.Embed:
     """
     Pinned card in #what's-playing-now.
 
-    The TV bot handles individual match cards and spectator chat.
-    This card shows only:
+    Shows:
       • Current round status / deadline
-      • Colour-coded standings table (🟩 W / 🟥 L / ➖ upcoming)
+      • VP-per-round standings table (49L / 81W / 72W / - / -)
 
     Removed vs old version:
       • VS match cards (TV bot's job)
-      • Live VP scores (players submit at game end only)
-      • Event info block (mission, deployment, points)
+      • Live VP during a game (players submit at game end only)
+      • Event info block (mission, deployment, points limit)
       • Top performers section
     """
     from database import db_get_results_by_player
@@ -399,7 +413,7 @@ def build_spectator_dashboard_embed(
     done_rounds  = sum(1 for r in rounds if r["state"] == RndS.COMPLETE)
     total_rounds = calculate_rounds(event["max_players"])
 
-    # ── Title + status line ───────────────────────────────────────────────
+    # ── Title + status ────────────────────────────────────────────────────
     if round_obj:
         rnum = round_obj["round_number"]
         if live:
@@ -414,7 +428,7 @@ def build_spectator_dashboard_embed(
 
     embed = discord.Embed(title=title, description=status, color=colour)
 
-    # ── Standings table ───────────────────────────────────────────────────
+    # ── Standings ─────────────────────────────────────────────────────────
     if standings:
         player_results = db_get_results_by_player(event["event_id"])
         table = _standings_table(standings, total_rounds, player_results)
@@ -434,9 +448,8 @@ def build_spectator_dashboard_embed(
 
 def build_standings_embed(event: dict, standings: List[dict], final: bool = False) -> discord.Embed:
     """
-    Standalone /standings command embed.
-    Same colour-coded per-round format as the dashboard,
-    with VP diff added for the more detailed crew/player view.
+    Standalone /standings command embed — same VP-per-round format as the
+    dashboard, with total VP and VP diff appended for the full detailed view.
     """
     from database import db_get_results_by_player
     from threads  import calculate_rounds
@@ -454,21 +467,22 @@ def build_standings_embed(event: dict, standings: List[dict], final: bool = Fals
     p_results    = db_get_results_by_player(event["event_id"])
 
     max_name = max((len(s["player_username"]) for s in standings), default=8)
-    name_w   = min(max_name, 16)
+    name_w   = min(max_name, 18)
+    SLOT_W   = 4
 
     lines = []
     for i, s in enumerate(standings, 1):
-        pid   = s["player_id"]
-        name  = s["player_username"][:name_w].ljust(name_w)
-        medal = medals.get(i, f"{i:>2}.")
-        w     = s.get("wins", 0)
-        l     = s.get("losses", 0)
-        vdiff = s.get("vp_diff", 0)
+        pid    = s["player_id"]
+        name   = s["player_username"][:name_w].ljust(name_w)
+        medal  = medals.get(i, f"{i:>2}.")
+        vp_tot = s.get("vp_total", 0)
+        vdiff  = s.get("vp_diff", 0)
 
-        pr   = p_results.get(pid, {})
-        dots = " ".join(_DOT[pr.get(rn)] for rn in range(1, total_rounds + 1))
+        pr    = p_results.get(pid, {})
+        slots = [_round_slot(pr.get(rn)).rjust(SLOT_W) for rn in range(1, total_rounds + 1)]
+        score_str = " / ".join(slots)
 
-        lines.append(f"`{medal} {name}` {dots}  `{w}W {l}L  {vdiff:+}VP`")
+        lines.append(f"`{medal} {name}  {score_str}   {vp_tot}VP ({vdiff:+})`")
 
     embed = discord.Embed(title=title, description="\n".join(lines), color=colour)
 
@@ -476,7 +490,7 @@ def build_standings_embed(event: dict, standings: List[dict], final: bool = Fals
         embed.set_footer(
             text=(
                 f"Round {done_rounds}/{total_rounds}  ·  "
-                f"🟩 Win  🟥 Loss  🟨 Draw  ➖ Upcoming  ·  "
+                f"Format: VP scored + W/L/D per round  ·  "
                 f"Last updated {datetime.utcnow().strftime('%H:%M')} UTC"
             )
         )
