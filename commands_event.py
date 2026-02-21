@@ -28,12 +28,16 @@ from typing import Dict
 from config import (GUILD_ID, GUILD, EVENT_NOTICEBOARD_ID, WHATS_PLAYING_ID,
                     COLOUR_GOLD, COLOUR_CRIMSON, COLOUR_AMBER, COLOUR_SLATE,
                     WARHAMMER_ARMIES, TOURNAMENT_MISSIONS, fe, faction_colour)
-from state import ES, RS, FMT, is_to
+from state import ES, RS, FMT, is_to, get_thread_reg
 from database import *
 from threads import (ensure_submissions_thread, ensure_lists_thread,
-                     add_player_to_event_threads, calculate_rounds)
+                     add_player_to_event_threads, calculate_rounds,
+                     ensure_all_round_threads)
 from embeds import (build_event_announcement_embed, build_list_review_header,
-                    build_player_list_embed, build_spectator_dashboard_embed)
+                    build_player_list_embed, build_spectator_dashboard_embed,
+                    build_event_main_embed, build_schedule_embed,
+                    build_missions_embed, build_judges_on_duty_embed,
+                    build_standings_embed)
 from views import EventAnnouncementView, RegistrationApprovalView
 from services import (refresh_spectator_dashboard, ac_active_events,
                       ac_all_events, ac_missions, ac_armies, ac_detachments,
@@ -247,8 +251,8 @@ async def event_lock_lists(interaction: discord.Interaction, event_id: str):
         ephemeral=True,
     )
 
-@event_grp.command(name="start", description="Start the event and post spectator dashboard")
-@app_commands.autocomplete(event_id=ac_active_events)
+# FIX: removed duplicate @event_grp.command(name="start") decorator that was causing
+# Discord.py to raise an error at startup (duplicate command registration).
 @event_grp.command(name="start", description="Start the event — post pinned cards and create threads")
 @app_commands.autocomplete(event_id=ac_active_events)
 async def event_start(interaction: discord.Interaction, event_id: str):
@@ -274,8 +278,8 @@ async def event_start(interaction: discord.Interaction, event_id: str):
             build_event_main_embed(event, regs),
             build_schedule_embed(event),
             build_missions_embed(event),
-            build_judges_on_duty_embed(interaction.guild),   # Chunk 1
-            build_standings_embed(event, []),                # Chunk 2 — empty to start
+            build_judges_on_duty_embed(interaction.guild),
+            build_standings_embed(event, []),
         ]:
             msg = await nb_ch.send(embed=embed)
             pinned_msgs.append(msg)
@@ -287,7 +291,7 @@ async def event_start(interaction: discord.Interaction, event_id: str):
 
         # Store judge card msg_id and standings msg_id for refresh
         reg = get_thread_reg(event_id)
-        reg["judge_msg_id"]    = pinned_msgs[3].id
+        reg["judge_msg_id"]     = pinned_msgs[3].id
         reg["standings_msg_id"] = pinned_msgs[4].id
         db_update_event(event_id, {
             "noticeboard_msg_id": str(pinned_msgs[0].id),
@@ -328,13 +332,13 @@ async def event_start(interaction: discord.Interaction, event_id: str):
         f"Use `/round briefing` to begin Day 1.",
         ephemeral=True,
     )
+    # FIX: removed duplicate log_immediate call that was sending two identical log messages
     await log_immediate(
         interaction.client, "Event Started",
         f"🏆 **{event['name']}** is LIVE\n"
         f"{total_rounds} round threads created  ·  5 cards pinned",
         COLOUR_CRIMSON,
     )
-    await log_immediate(interaction.client, "Event Started", f"🏆 **{event['name']}** is LIVE", COLOUR_CRIMSON)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SLASH COMMANDS  —  REGISTRATION
@@ -412,3 +416,58 @@ async def reg_list(interaction: discord.Interaction, event_id: str):
             lines = [f"{icons[state]} {fe(r['army'])} **{r['player_username']}** — *{r['army']}*" for r in group]
             embed.add_field(name=state.capitalize(), value="\n".join(lines), inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MODAL  —  list submission (used by reg_submit and RegistrationApprovalView)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ListSubmissionModal(discord.ui.Modal, title="Submit Army List"):
+    list_text = discord.ui.TextInput(
+        label="Paste your army list here",
+        style=discord.TextStyle.paragraph,
+        placeholder="Copy-paste your list from Wahapedia / BattleScribe / New Recruit…",
+        required=True,
+        max_length=4000,
+    )
+
+    def __init__(self, event_id: str, army: str, detachment: str):
+        super().__init__()
+        self.event_id   = event_id
+        self.army       = army
+        self.detachment = detachment
+
+    async def on_submit(self, interaction: discord.Interaction):
+        event = db_get_event(self.event_id)
+        if not event:
+            await interaction.response.send_message("❌ Event not found.", ephemeral=True); return
+
+        db_upsert_registration(
+            self.event_id, str(interaction.user.id),
+            interaction.user.display_name, RS.PENDING,
+            army=self.army, detachment=self.detachment,
+            list_text=self.list_text.value,
+        )
+
+        # Post to submissions thread for TO review
+        sub_thread = await ensure_submissions_thread(
+            interaction.client, self.event_id, interaction.guild, event["name"]
+        )
+        if sub_thread:
+            view  = RegistrationApprovalView(self.event_id, str(interaction.user.id))
+            embed = discord.Embed(
+                title=f"📋  List Submitted  —  {interaction.user.display_name}",
+                description=(
+                    f"{fe(self.army)} **{self.army}**  ·  *{self.detachment}*\n\n"
+                    f"```\n{self.list_text.value[:1800]}\n```"
+                ),
+                color=COLOUR_AMBER,
+            )
+            await sub_thread.send(embed=embed, view=view)
+
+        await interaction.response.send_message(
+            f"✅ List submitted for **{event['name']}**!\n"
+            f"Army: {fe(self.army)} **{self.army}**  ·  *{self.detachment}*\n"
+            f"A TO will review and approve your registration shortly.",
+            ephemeral=True,
+        )
