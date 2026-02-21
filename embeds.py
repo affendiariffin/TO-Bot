@@ -13,7 +13,7 @@ Functions:
   • build_spectator_dashboard_embed
   • build_list_review_header
   • build_player_list_embed
-  • build_judge_queue_embed
+  • build_judges_on_duty_embed
 
 Imported by: services.py, views.py, commands_*.py
 """
@@ -316,50 +316,74 @@ def build_player_list_embed(reg: dict, index: int) -> discord.Embed:
         embed.set_footer(text=f"Submitted {reg['submitted_at'].strftime('%d %b %Y  %H:%M UTC')}")
     return embed
 
-def build_judge_queue_embed(event: dict, calls: List[dict], round_obj: Optional[dict],
-                             judges: List[dict]) -> discord.Embed:
-    open_calls = [c for c in calls if c["state"] == JCS.OPEN]
-    ack_calls  = [c for c in calls if c["state"] == JCS.ACKNOWLEDGED]
+def build_judges_on_duty_embed(
+    guild: discord.Guild,
+    round_obj: Optional[dict] = None,
+) -> discord.Embed:
+    """
+    Read-only Judges on Duty card.
 
-    if not calls:
+    Availability is derived purely from voice channel presence:
+      🟢 available  — not in any Game Room (safe to DM)
+      🔵 in-game    — currently in a Game Room (judging a match)
+
+    Players should DM a 🟢 available judge directly.
+    VP adjustments applied by crew via /result adjust after the round.
+    """
+    from state import get_judges_for_guild
+    judges    = get_judges_for_guild(guild)
+    available = [j for j in judges if j["available"]]
+    in_game   = [j for j in judges if not j["available"]]
+
+    # Card colour reflects whether anyone is free
+    if not judges:
+        colour = COLOUR_SLATE
+    elif available:
         colour = discord.Color.green()
-        title  = "⚖️  Judge Queue  —  All Clear"
-        desc   = "*No active judge calls.*"
-    elif len(calls) <= 2:
-        colour = COLOUR_AMBER
-        title  = f"⚖️  Judge Queue  —  {len(calls)} Call{'s' if len(calls)!=1 else ''}"
-        desc   = ""
     else:
-        colour = COLOUR_CRIMSON
-        title  = f"⚖️  Judge Queue  —  {len(calls)} Calls ⚠️"
-        desc   = f"**{len(open_calls)} waiting · {len(ack_calls)} in progress**"
+        colour = COLOUR_AMBER
 
-    embed = discord.Embed(title=title, description=desc, color=colour)
+    title = "⚖️  Judges on Duty"
 
-    # ── Judge roster ───────────────────────────────────────────────────────
-    if judges:
-        roster_lines = []
-        for j in judges:
-            if j.get("call_id"):
-                roster_lines.append(f"🔴  **{j['name']}** — Room {j['room'] or '?'}")
-            elif j.get("online"):
-                roster_lines.append(f"🟢  **{j['name']}** — available")
-            else:
-                roster_lines.append(f"⚫  **{j['name']}** — offline")
-        embed.add_field(name="⚖️  Judges on Duty", value="\n".join(roster_lines), inline=False)
+    # Build roster lines
+    lines: list[str] = []
+    for j in available:
+        lines.append(f"🟢  **{j['name']}** — available  ·  {j['mention']}")
+    for j in in_game:
+        lines.append(f"🔵  **{j['name']}** — {j['room']}")
+    if not judges:
+        lines = ["*No judges currently assigned.*"]
 
-    # ── Active calls ───────────────────────────────────────────────────────
-    for c in calls:
-        state_icon = "🔴" if c["state"] == JCS.OPEN else "🟡"
-        ack_info   = ""
-        if c["state"] == JCS.ACKNOWLEDGED:
-            ack_info = f"\n*Acknowledged by {c.get('acknowledged_by_name','—')}*"
+    embed = discord.Embed(
+        title=title,
+        description="\n".join(lines),
+        color=colour,
+    )
+
+    if available:
         embed.add_field(
-            name=f"{state_icon}  Room {c['room_number']}  —  {c['raised_by_name']}",
-            value=f"Called {ts(c['raised_at'])}{ack_info}",
+            name="📩  Need a ruling?",
+            value=(
+                "DM a 🟢 available judge directly.\n"
+                "They will come to your Game Room."
+            ),
+            inline=False,
+        )
+    else:
+        embed.add_field(
+            name="📩  All judges are in a game",
+            value=(
+                "Wait for a judge to finish their current room — "
+                "this card updates automatically."
+            ),
             inline=False,
         )
 
+    # Footer — round info + last updated timestamp
+    parts = []
     if round_obj:
-        embed.set_footer(text=f"Round {round_obj['round_number']}  ·  {event['name']}")
+        parts.append(f"Round {round_obj['round_number']}")
+    parts.append(f"Last updated {datetime.utcnow().strftime('%H:%M')} UTC")
+    embed.set_footer(text="  ·  ".join(parts))
+
     return embed
