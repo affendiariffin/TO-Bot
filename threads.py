@@ -17,11 +17,11 @@ Sections:
 Imported by: services.py, commands_*.py, ritual.py
 """
 import discord
-import asyncio, math
+import asyncio, math, re  # FIX: added `re` (used in assign_rooms)
 from datetime import datetime
 from typing import List, Optional, Dict
 from config import (EVENT_NOTICEBOARD_ID, CREW_ROLE_ID, PLAYER_ROLE_ID,
-                    CAPTAINS_ROLE_ID, GUILD_ID)
+                    CAPTAINS_ROLE_ID, GUILD_ID, GAME_ROOM_PREFIX)
 from state import get_thread_reg, thread_registry
 from database import *
 
@@ -482,4 +482,3 @@ def db_apply_team_result(eid: str, team_id: str, tp: int, gp: int, vp_diff: int,
                 WHERE event_id=%s AND team_id=%s
             """, (wins, losses, draws, tp, gp, vp_diff, eid, team_id))
             conn.commit()
-
