@@ -104,9 +104,11 @@ async def check_round_deadlines():
 async def refresh_dashboards():
     guild = bot.get_guild(GUILD_ID)
     for event in db_get_active_events():
-        await refresh_spectator_dashboard(bot, event["event_id"])
+        eid = event["event_id"]
+        await refresh_spectator_dashboard(bot, eid)
         if guild:
-            await _refresh_judges_on_duty(bot, event["event_id"], guild)
+            await _refresh_judges_on_duty(bot, eid, guild)
+            await refresh_standings_card(bot, eid)
 
 @flush_batch_logs.before_loop
 @check_round_deadlines.before_loop
