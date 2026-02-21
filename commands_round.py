@@ -36,7 +36,7 @@ from embeds import (build_briefing_embed, build_pairings_embed,
                     build_standings_embed, build_spectator_dashboard_embed,
                     build_player_list_embed)
 from views import PairingActionView, VPAdjustModal
-from services import (refresh_spectator_dashboard, _refresh_judge_queue,
+from services import (refresh_spectator_dashboard, _refresh_judges_on_duty,
                       ac_active_events, ac_all_events, ac_active_games,
                       ac_complete_games, ac_approved_regs, log_immediate)
 
@@ -99,9 +99,9 @@ async def round_start(interaction: discord.Interaction, event_id: str, duration_
                       "army": r["army"], "detachment": r["detachment"],
                       "wins": 0, "losses": 0, "vp_diff": 0, "had_bye": False} for r in regs]
 
-    previous         = get_previous_pairings(event_id)
+    previous             = get_previous_pairings(event_id)
     pairings, bye_player = swiss_pair(standings, previous)
-    assigned         = assign_rooms(pairings, interaction.guild)
+    assigned             = assign_rooms(pairings, interaction.guild)
 
     games_data = []
     for item in assigned:
@@ -122,23 +122,24 @@ async def round_start(interaction: discord.Interaction, event_id: str, duration_
             "player1_army": bye_player["army"],     "player1_detachment": bye_player["detachment"],
             "is_bye": True,
         })
-        db_update_standing(event_id, bye_player["player_id"], {"had_bye": True})
 
     round_obj    = db_get_round(round_id)
     all_games    = db_get_games(round_id)
     ch           = interaction.guild.get_channel(EVENT_NOTICEBOARD_ID)
     round_thread = None
+    reg_t        = get_thread_reg(event_id)
+    tid          = reg_t["rounds"].get(round_num)
+    if tid:
+        round_thread = interaction.guild.get_thread(tid)
+    if not round_thread:
+        round_thread = await ensure_round_thread(
+            interaction.client, event_id, round_num, interaction.guild, event["name"]
+        )
 
     if ch:
-        embed        = build_pairings_embed(event, round_obj, all_games, interaction.guild)
-        pairings_msg = await ch.send(embed=embed)
-        db_update_round(round_id, {"pairings_msg_id": str(pairings_msg.id)})
-
-        round_thread = await ensure_round_thread(
-            interaction.client, event_id, round_num, interaction.guild, event["name"], pairings_msg
-        )
+        embed = build_pairings_embed(event, round_obj, all_games, interaction.guild)
+        await ch.send(embed=embed)
         btn_target = round_thread or ch
-
         for gid, room, p1, p2 in games_data:
             view = PairingActionView(gid, event_id, room)
             await btn_target.send(
@@ -149,13 +150,15 @@ async def round_start(interaction: discord.Interaction, event_id: str, duration_
             await asyncio.sleep(0.3)
 
         if round_thread:
-            await ch.send(
-                f"⚔️ **Round {round_num} is LIVE!**  Deadline {ts(deadline)}\n"
+            mentions = " ".join(f"<@{p['player_id']}>" for p in standings)
+            await round_thread.send(
+                f"{mentions}\n"
+                f"⚔️ **Round {round_num} is live!**  Deadline {ts(deadline)}\n"
                 f"Players: submit results and raise judge calls in {round_thread.mention}",
                 silent=True,
             )
 
-    await _refresh_judge_queue(interaction.client, event_id, interaction.guild)
+    await _refresh_judges_on_duty(interaction.client, event_id, interaction.guild)
     await refresh_spectator_dashboard(interaction.client, event_id)
     await interaction.followup.send(
         f"✅ Round {round_num} started!  {len(assigned)} games  ·  Deadline {ts(deadline)}\n"
@@ -193,7 +196,7 @@ async def round_complete(interaction: discord.Interaction, event_id: str):
             ephemeral=True)
         return
 
-    bye_vp  = 0
+    bye_vp    = 0
     bye_games = [g for g in games if g["is_bye"]]
     if bye_games:
         avg_vp = get_avg_vp(event_id, round_obj["round_id"])
@@ -253,9 +256,9 @@ async def round_repair(interaction: discord.Interaction, event_id: str, duration
     if len(standings) < 2:
         await interaction.followup.send("❌ Not enough active players to pair.", ephemeral=True); return
 
-    previous         = get_previous_pairings(event_id)
+    previous             = get_previous_pairings(event_id)
     pairings, bye_player = swiss_pair(standings, previous)
-    assigned         = assign_rooms(pairings, interaction.guild)
+    assigned             = assign_rooms(pairings, interaction.guild)
 
     games_data = []
     for item in assigned:
@@ -405,7 +408,8 @@ async def event_finish(interaction: discord.Interaction, event_id: str):
         try:
             de = await interaction.guild.fetch_scheduled_event(int(event["discord_event_id"]))
             await de.end()
-        except: pass
+        except Exception:
+            pass
 
     await archive_event_threads(interaction.client, event_id, interaction.guild)
 
