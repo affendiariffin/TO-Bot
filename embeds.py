@@ -13,6 +13,7 @@ Functions:
   • build_list_review_header
   • build_player_list_embed
   • build_judges_on_duty_embed
+  • bbuild_standings_embed
 
 
 Imported by: services.py, views.py, commands_*.py
@@ -324,84 +325,77 @@ def build_judges_on_duty_embed(
     return embed
 def _round_slot(round_data: dict | None) -> str:
     """
-    Render a single round slot string.
-
-    Confirmed result:  "49L"  "81W"  "75D"
-    No result yet:     "-"
+    Raw slot string before right-justification.
+    Max 4 chars: "100W", "100L", "100D".
+    "-" only for a game that existed in a completed round but has no confirmed result.
     """
     if not round_data or round_data["vp"] is None:
         return "-"
-    vp  = round_data["vp"]
-    res = round_data["result"]
-    suffix = {"W": "W", "L": "L", "D": "D"}.get(res, "")
+    vp     = round_data["vp"]
+    result = round_data.get("result") or ""
+    suffix = result if result in ("W", "L", "D") else ""
     return f"{vp}{suffix}"
 
 
 def _standings_table(
     standings: List[dict],
-    total_rounds: int,
+    done_rounds: int,
     player_results: dict,
+    include_totals: bool = False,
 ) -> str:
     """
-    Builds the standings block.
-
-    Format per row (inside a code block for alignment):
-      Pos  Name              R1    R2    R3    R4    R5
-      🥇   FND               49L / 81W / 72W /  -  /  -
-      🥈   Alaric Daybreak   80W / 60L / 91W /  -  /  -
-
-    Slot width is fixed at 5 chars ("999W" + space padding) so scores align
-    regardless of VP value (max 10th ed VP is 100, so 3 digits + 1 letter = 4).
-    Name column is dynamic: capped at 18 chars, set by the longest name.
+    Monospace standings table in a code block.
+    Renders exactly done_rounds slot columns — never more.
     """
     if not standings:
         return "*No results yet.*"
 
+    # Pre-event or between Round 1 — just show roster order
+    if done_rounds == 0:
+        return "```\n" + "\n".join(
+            f"{(str(i) + '.').rjust(3)} {s['player_username'][:18]}"
+            for i, s in enumerate(standings, 1)
+        ) + "\n```"
+
+    SLOT_W   = 4   # "100W" is the widest possible value
     max_name = max((len(s["player_username"]) for s in standings), default=8)
     name_w   = min(max_name, 18)
 
-    # Fixed slot width: "100W" = 4 chars, pad to 4 then add " / " separator
-    SLOT_W = 4
-
-    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
-    lines  = []
-
+    lines = []
     for i, s in enumerate(standings, 1):
-        pid   = s["player_id"]
-        name  = s["player_username"][:name_w].ljust(name_w)
-        medal = medals.get(i, f"{i:>2}.")
+        pid  = s["player_id"]
+        pos  = f"{i}.".rjust(3)
+        name = s["player_username"][:name_w].ljust(name_w)
 
         pr    = player_results.get(pid, {})
-        slots = []
-        for rn in range(1, total_rounds + 1):
-            slot_str = _round_slot(pr.get(rn))
-            slots.append(slot_str.rjust(SLOT_W))
-
+        slots = [
+            _round_slot(pr.get(rn)).rjust(SLOT_W)
+            for rn in range(1, done_rounds + 1)
+        ]
         score_str = " / ".join(slots)
-        lines.append(f"`{medal} {name}  {score_str}`")
 
-    return "\n".join(lines)
+        if include_totals:
+            vp_tot = s.get("vp_total", 0)
+            vdiff  = s.get("vp_diff", 0)
+            totals = f"  {vp_tot:>3}VP ({vdiff:>+4})"
+        else:
+            totals = ""
+
+        lines.append(f"{pos} {name}  {score_str}{totals}")
+
+    return "```\n" + "\n".join(lines) + "\n```"
 
 
 def build_spectator_dashboard_embed(
     event: dict,
     round_obj: Optional[dict],
-    games: List[dict],        # kept for API compatibility — not rendered here
+    games: List[dict],
     standings: List[dict],
     guild: discord.Guild,
 ) -> discord.Embed:
     """
     Pinned card in #what's-playing-now.
-
-    Shows:
-      • Current round status / deadline
-      • VP-per-round standings table (49L / 81W / 72W / - / -)
-
-    Removed vs old version:
-      • VS match cards (TV bot's job)
-      • Live VP during a game (players submit at game end only)
-      • Event info block (mission, deployment, points limit)
-      • Top performers section
+    Shows round status + VP standings for completed rounds only.
     """
     from database import db_get_results_by_player
     from threads  import calculate_rounds
@@ -429,19 +423,23 @@ def build_spectator_dashboard_embed(
     embed = discord.Embed(title=title, description=status, color=colour)
 
     # ── Standings ─────────────────────────────────────────────────────────
+    field_name = (
+        f"📊  Standings  (after Round {done_rounds} of {total_rounds})"
+        if done_rounds else "📊  Standings"
+    )
     if standings:
         player_results = db_get_results_by_player(event["event_id"])
-        table = _standings_table(standings, total_rounds, player_results)
-        embed.add_field(name="📊  Standings", value=table, inline=False)
+        table = _standings_table(standings, done_rounds, player_results)
+        embed.add_field(name=field_name, value=table, inline=False)
     else:
-        embed.add_field(name="📊  Standings", value="*No results yet.*", inline=False)
+        embed.add_field(name=field_name, value="*No results yet.*", inline=False)
 
     # ── Footer ────────────────────────────────────────────────────────────
-    footer_parts = []
+    parts = []
     if done_rounds > 0:
-        footer_parts.append(f"After Round {done_rounds}")
-    footer_parts.append(f"Last updated {datetime.utcnow().strftime('%H:%M')} UTC")
-    embed.set_footer(text="  ·  ".join(footer_parts))
+        parts.append(f"After Round {done_rounds}")
+    parts.append(f"Last updated {datetime.utcnow().strftime('%H:%M')} UTC")
+    embed.set_footer(text="  ·  ".join(parts))
 
     return embed
 
@@ -491,6 +489,40 @@ def build_standings_embed(event: dict, standings: List[dict], final: bool = Fals
             text=(
                 f"Round {done_rounds}/{total_rounds}  ·  "
                 f"Format: VP scored + W/L/D per round  ·  "
+                f"Last updated {datetime.utcnow().strftime('%H:%M')} UTC"
+            )
+        )
+    else:
+        embed.set_footer(text="Tournament complete  ·  Results submitted to Scorebot for ELO calculation")
+
+    return embed
+
+def build_standings_embed(event: dict, standings: List[dict], final: bool = False) -> discord.Embed:
+    """
+    /standings command embed — completed rounds only, with total VP and VP diff.
+    """
+    from database import db_get_results_by_player
+    from threads  import calculate_rounds
+
+    title  = f"🏆  Final Standings — {event['name']}" if final else f"📊  Standings — {event['name']}"
+    colour = COLOUR_GOLD if final else COLOUR_SLATE
+
+    if not standings:
+        return discord.Embed(title=title, description="No results yet.", color=colour)
+
+    rounds       = db_get_rounds(event["event_id"])
+    done_rounds  = sum(1 for r in rounds if r["state"] == RndS.COMPLETE)
+    total_rounds = calculate_rounds(event["max_players"])
+    p_results    = db_get_results_by_player(event["event_id"])
+
+    table = _standings_table(standings, done_rounds, p_results, include_totals=True)
+    embed = discord.Embed(title=title, description=table, color=colour)
+
+    if not final:
+        embed.set_footer(
+            text=(
+                f"Round {done_rounds}/{total_rounds}  ·  "
+                f"Format: VP + W/L/D per completed round  ·  "
                 f"Last updated {datetime.utcnow().strftime('%H:%M')} UTC"
             )
         )
