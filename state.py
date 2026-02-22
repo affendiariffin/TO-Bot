@@ -190,3 +190,4 @@ def get_thread_reg(event_id: str) -> dict:
         "rounds":           {},     
         "judge_msg_id":     None,   
         "standings_msg_id": None,   
+        })
