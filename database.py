@@ -214,6 +214,8 @@ def init_db():
                 "event_missions TEXT",
                 "rules_cutoff TEXT",
                 "reg_deadline TEXT",
+                # WTC: scoring mode for team events ('ntl' or 'wtc')
+                "scoring_mode TEXT DEFAULT 'ntl'",
             ):
                 cur.execute(f"ALTER TABLE tournament_events ADD COLUMN IF NOT EXISTS {col_def}")
             cur.execute(
@@ -227,8 +229,17 @@ def init_db():
                 "team_draws INTEGER DEFAULT 0",
                 "team_points INTEGER DEFAULT 0",
                 "game_points INTEGER DEFAULT 0",
+                # WTC: per-player WTC GP accumulated across rounds (individual standings)
+                "wtc_gp INTEGER DEFAULT 0",
             ):
                 cur.execute(f"ALTER TABLE tournament_standings ADD COLUMN IF NOT EXISTS {col_def}")
+
+            # WTC: per-game WTC GP values stored on the game record
+            for col_def in (
+                "player1_wtc_gp INTEGER",
+                "player2_wtc_gp INTEGER",
+            ):
+                cur.execute(f"ALTER TABLE tournament_games ADD COLUMN IF NOT EXISTS {col_def}")
 
             cur.execute("ALTER TABLE tournament_rounds ADD COLUMN IF NOT EXISTS active_team_round_id TEXT")
 
@@ -612,6 +623,71 @@ def db_update_standing(eid: str, pid: str, updates: dict):
         with conn.cursor() as cur:
             cur.execute(f"UPDATE tournament_standings SET {fields} WHERE event_id=%s AND player_id=%s",
                         list(updates.values()) + [eid, pid])
+            conn.commit()
+
+def db_apply_wtc_gp_to_standing(eid: str, player_id: str, wtc_gp_delta: int):
+    """Accumulate WTC GP for an individual player's standing row (WTC-mode team events)."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE tournament_standings
+                SET wtc_gp = COALESCE(wtc_gp, 0) + %s
+                WHERE event_id=%s AND player_id=%s
+            """, (wtc_gp_delta, eid, player_id))
+            conn.commit()
+
+def db_get_team_round_by_game(game_id: str) -> Optional[dict]:
+    """Find the team_round that contains a given game via tournament_team_pairings."""
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                SELECT tr.* FROM tournament_team_rounds tr
+                JOIN tournament_team_pairings tp ON tp.team_round_id = tr.team_round_id
+                WHERE tp.game_id = %s
+                LIMIT 1
+            """, (game_id,))
+            r = cur.fetchone()
+    return dict(r) if r else None
+
+def db_get_team_id_for_player_in_round(game_id: str, player_id: str) -> Optional[str]:
+    """Return the team_id for a given player within a specific game's pairing."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT defender_team_id, attacker_team_id,
+                       defender_player_id, attacker_player_id
+                FROM tournament_team_pairings
+                WHERE game_id = %s
+                LIMIT 1
+            """, (game_id,))
+            r = cur.fetchone()
+    if not r:
+        return None
+    if r[2] == player_id:
+        return r[0]  # defender_team_id
+    if r[3] == player_id:
+        return r[1]  # attacker_team_id
+    return None
+
+def db_accumulate_wtc_team_score(team_round_id: str, team_a_id: str,
+                                  team_a_delta: int, team_b_delta: int):
+    """Add WTC GP increments to both teams' running totals in a team_round."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE tournament_team_rounds
+                SET team_a_score = COALESCE(team_a_score, 0) + %s,
+                    team_b_score = COALESCE(team_b_score, 0) + %s
+                WHERE team_round_id = %s AND team_a_id = %s
+            """, (team_a_delta, team_b_delta, team_round_id, team_a_id))
+            # Also handle the case where caller passed teams in reversed order
+            cur.execute("""
+                UPDATE tournament_team_rounds
+                SET team_a_score = COALESCE(team_a_score, 0) + %s,
+                    team_b_score = COALESCE(team_b_score, 0) + %s
+                WHERE team_round_id = %s AND team_a_id != %s
+                  AND team_b_id = %s
+            """, (team_b_delta, team_a_delta, team_round_id, team_a_id, team_a_id))
             conn.commit()
 
 def db_apply_result_to_standings(eid: str, winner_id: str, loser_id: str, winner_vp: int, loser_vp: int):
