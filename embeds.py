@@ -283,14 +283,21 @@ def build_team_event_card(
     embed.add_field(name="🎲  Rounds",        value=f"{round_count} · Swiss",   inline=True)
     embed.add_field(name="🧑‍🤝‍🧑  Team Size",  value=f"{t_size} players/team",   inline=True)
 
-    # Schedule
+    # Schedule — labels padded to align times column; times bold
+    # Emojis render ~2 chars wide, so visual_len counts each emoji cluster as +2
     sched_slots: list = event.get("_schedule_slots") or []
     if sched_slots:
+        import re as _re
+        def _visual_len(lbl: str) -> int:
+            plain = _re.sub(r"[^\x00-\x7F]", "", lbl).strip()
+            emoji_clusters = len(_re.findall(r"[^\x00-\x7F]+", lbl))
+            return len(plain) + emoji_clusters * 2
+        max_vlen = max(_visual_len(s["label"]) for s in sched_slots)
         sched_lines = []
         for s in sched_slots:
+            pad  = "\u2002" * (max_vlen - _visual_len(s["label"]))
             ts_s = f"<t:{int(s['start_dt'].timestamp())}:t>"
-            ts_e = f"<t:{int(s['end_dt'].timestamp())}:t>"
-            sched_lines.append(f"{s['label']}  {ts_s}–{ts_e}")
+            sched_lines.append(f"{s['label']}{pad}  **{ts_s}**")
         embed.add_field(name="🕗  Schedule (KL time)", value="\n".join(sched_lines), inline=False)
     else:
         embed.add_field(name="🕗  Start Time", value=f"**8:30am KL time** on {dstr}", inline=False)
@@ -313,6 +320,7 @@ def build_team_event_card(
         embed.add_field(name="📅  Key Dates", value="\n".join(date_lines), inline=False)
 
     # Registration sections
+    slots_full = isinstance(max_teams, int) and (len(confirmed) + len(chop)) >= max_teams
     if not deadline_passed:
         embed.add_field(
             name=f"✅  Confirmed  ({len(confirmed)}/{max_teams})",
@@ -321,7 +329,7 @@ def build_team_event_card(
         )
         embed.add_field(
             name=f"✊  Chop  ({len(chop)})",
-            value="\n".join(_team_line(t, "✊") for t in chop) or "*None yet*",
+            value="\n".join(_team_line(t, "✊") for t in chop) or ("*Full*" if slots_full else "*None yet*"),
             inline=True,
         )
         embed.add_field(
@@ -332,7 +340,7 @@ def build_team_event_card(
         embed.set_footer(
             text=(
                 "Captain: click Chop ✊ to register your team and submit all lists  ·  "
-                "TO reviews and confirms your spot  ·  Lists are private until deadline"
+                "TO reviews and confirms your spot  ·  Lists are private until registration closes"
             )
         )
     else:
