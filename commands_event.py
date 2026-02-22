@@ -27,7 +27,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict
 from config import (GUILD_ID, GUILD, EVENT_NOTICEBOARD_ID, WHATS_PLAYING_ID,
                     COLOUR_GOLD, COLOUR_CRIMSON, COLOUR_AMBER, COLOUR_SLATE,
-                    TOURNAMENT_MISSIONS, fe, faction_colour)
+                    fe, faction_colour)
 from state import ES, RS, FMT, is_to, get_thread_reg
 from database import *
 from threads import (ensure_submissions_thread, ensure_lists_thread,
@@ -104,7 +104,8 @@ async def event_create(
     except ValueError:
         await interaction.followup.send("❌ Date format must be YYYY-MM-DD.", ephemeral=True); return
 
-    if mission not in TOURNAMENT_MISSIONS:
+    mission_obj = db_get_mission(mission)
+    if not mission_obj:
         await interaction.followup.send("❌ Invalid mission code.", ephemeral=True); return
 
     team_sz  = FMT.team_size(format)
@@ -132,7 +133,7 @@ async def event_create(
     # Discord Scheduled Event
     try:
         start_dt = datetime.combine(sd, datetime.min.time()).replace(hour=9, tzinfo=timezone.utc)
-        m = TOURNAMENT_MISSIONS[mission]
+        m = mission_obj
         fmt_label = {
             "singles": "Singles", "2v2": "2v2",
             "teams_3": "Teams 3s", "teams_5": "Teams 5s", "teams_8": "Teams 8s",
@@ -168,7 +169,7 @@ async def event_create(
         interaction.client,
         "Event Created",
         f"🏆 **{name}** by {interaction.user.display_name}\n"
-        f"Format: {fmt_label} · Mission {mission}: {TOURNAMENT_MISSIONS[mission]['name']} · {ind_pts}pts · {sd}→{ed}",
+        f"Format: {fmt_label} · Mission {mission}: {mission_obj["name"]} · {ind_pts}pts · {sd}→{ed}",
         COLOUR_GOLD,
     )
 
