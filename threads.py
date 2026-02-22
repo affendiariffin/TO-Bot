@@ -416,6 +416,73 @@ def ntl_gp(winner_vp: int, loser_vp: int) -> tuple:
             return wgp, lgp
     return 20, 0
 
+# ── WTC GP scoring table ──────────────────────────────────────────────────────
+# WTC uses the same differential table as NTL for per-game GP conversion.
+# The key difference is at the TEAM level: sum of individual WTC GPs determines
+# the team result using fixed thresholds (not ratio-scaled like NTL):
+#   Team GP > 85  → Win  (2 Tournament Points)
+#   Team GP 75-85 → Tie  (1 Tournament Point)
+#   Team GP < 75  → Loss (0 Tournament Points)
+# Maximum team GP = team_size × 20 (e.g. 5s = 100, 8s = 160, 3s = 60)
+
+WTC_GP_TABLE = NTL_GP_TABLE  # Same per-game conversion table
+
+def wtc_gp(p1_vp: int, p2_vp: int) -> tuple:
+    """
+    Given raw VP scores for both players, return (p1_wtc_gp, p2_wtc_gp).
+    Uses the WTC table: higher VP scorer gets the 'winner' GP.
+    On an exact VP tie, both players get 10 GP.
+    """
+    if p1_vp == p2_vp:
+        return 10, 10
+    diff = abs(p1_vp - p2_vp)
+    for lo, hi, winner_gp, loser_gp in WTC_GP_TABLE:
+        if lo <= diff <= hi:
+            if p1_vp > p2_vp:
+                return winner_gp, loser_gp
+            else:
+                return loser_gp, winner_gp
+    # Diff > 50
+    if p1_vp > p2_vp:
+        return 20, 0
+    return 0, 20
+
+def wtc_team_result(total_wtc_gp: int) -> tuple:
+    """
+    Given a team's summed WTC GP total, return (tournament_points, result_str).
+    Uses FIXED WTC thresholds (not ratio-scaled):
+      > 85 GP  → Win  (2 TP)
+      75-85 GP → Tie  (1 TP)
+      < 75 GP  → Loss (0 TP)
+    """
+    if total_wtc_gp > 85:
+        return 2, "Win"
+    elif total_wtc_gp >= 75:
+        return 1, "Tie"
+    else:
+        return 0, "Loss"
+
+def wtc_team_result_pair(gp_a: int, gp_b: int) -> tuple:
+    """
+    Resolve both teams' WTC results together, returning
+    (tp_a, result_a, tp_b, result_b).
+    If both would be 'Win' (shouldn't happen with correct data but as a safety),
+    the higher GP team wins; if equal, it's a Tie for both.
+    """
+    tp_a, res_a = wtc_team_result(gp_a)
+    tp_b, res_b = wtc_team_result(gp_b)
+    # Safety: two wins is logically impossible (GPs sum to team_size×20),
+    # but resolve gracefully anyway.
+    if tp_a == 2 and tp_b == 2:
+        if gp_a > gp_b:
+            tp_b, res_b = 0, "Loss"
+        elif gp_b > gp_a:
+            tp_a, res_a = 0, "Loss"
+        else:
+            tp_a, res_a = 1, "Tie"
+            tp_b, res_b = 1, "Tie"
+    return tp_a, res_a, tp_b, res_b
+
 def ntl_team_result(total_gp: int, max_gp: int) -> tuple:
     """
     Given total GP scored by a team and max possible GP,
