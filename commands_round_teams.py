@@ -24,7 +24,7 @@ from state import ES, RndS, TRS, FMT, TS, GS, is_to
 from database import *
 from threads import (ensure_round_thread, team_swiss_pair,
                      get_previous_team_pairings, ntl_team_result,
-                     calculate_rounds, db_get_team_standings,
+                     event_round_count, db_get_team_standings,
                      db_upsert_team_standing, db_apply_team_result)
 from embeds import build_team_standings_embed, build_standings_embed
 from views import PairingActionView
@@ -58,7 +58,7 @@ async def round_pair_teams(interaction: discord.Interaction, event_id: str, dura
 
     existing   = db_get_rounds(event_id)
     round_num  = len(existing) + 1
-    max_rounds = calculate_rounds(len(ready_teams))
+    max_rounds = event_round_count(event)
     if round_num > max_rounds:
         await interaction.followup.send(f"❌ All {max_rounds} rounds complete.", ephemeral=True); return
 
