@@ -29,7 +29,6 @@ from config import (COLOUR_GOLD, COLOUR_CRIMSON, COLOUR_AMBER, COLOUR_SLATE,
                     fe, faction_colour, room_colour, ts, ts_full)
 from state import GS, RndS, JCS, FMT, get_judges_for_guild
 from database import db_get_rounds, db_get_mission
-from threads import calculate_rounds
 
 # ══════════════════════════════════════════════════════════════════════════════
 # HELPERS
@@ -123,7 +122,7 @@ def build_event_main_embed(event: dict, regs: list) -> discord.Embed:
     multi       = sd != ed
     dstr        = (f"{sd.strftime('%a %d %b')} — {ed.strftime('%a %d %b %Y')}"
                    if multi else sd.strftime("%A %d %B %Y"))
-    total_rounds = calculate_rounds(event["max_players"])
+    total_rounds = event.get("round_count", 3)
     fmt_label   = {
         "singles": "Singles", "2v2": "2v2",
         "teams_3": "Teams 3s", "teams_5": "Teams 5s", "teams_8": "Teams 8s",
@@ -156,7 +155,7 @@ def build_schedule_embed(event: dict) -> discord.Embed:
     Pinned by admin. Shows day/round breakdown and key times.
     Admin edits the message manually if times change.
     """
-    total_rounds = calculate_rounds(event["max_players"])
+    total_rounds = event.get("round_count", 3)
     rpd          = event["rounds_per_day"]
     days         = math.ceil(total_rounds / rpd)
     sd           = event["start_date"]
@@ -184,17 +183,45 @@ def build_schedule_embed(event: dict) -> discord.Embed:
 def build_missions_embed(event: dict) -> discord.Embed:
     """
     Card 3 — Missions.
-    Shows the mission pack info for the event.
+    Singles/2v2: shows the full round-by-round pairings table set at creation.
+    Team formats: shows the layout + mission pools captains draw from each ritual.
     """
-    m = db_get_mission(event["mission_code"])
+    fmt = event.get("format", "singles")
 
     embed = discord.Embed(
         title=f"🗺️  Mission Pack  —  {event['name']}",
         color=COLOUR_GOLD,
     )
-    embed.add_field(name="Mission",    value=f"**{m.get('name', '—')}**",           inline=True)
-    embed.add_field(name="Deployment", value=f"*{m.get('deployment', '—')}*",        inline=True)
-    embed.add_field(name="Layouts",    value=", ".join(m.get("layouts", [])) or "—", inline=False)
+
+    if fmt in ("singles", "2v2"):
+        pairings = event.get("event_pairings") or []
+        if pairings:
+            lines = []
+            for i, p in enumerate(pairings):
+                m = db_get_mission(p["mission"])
+                lines.append(
+                    f"**Round {i+1}**  ·  Layout **{p['layout']}**  ·  "
+                    f"{m.get('name','?')}  (*{m.get('deployment','?')}*)"
+                )
+            embed.add_field(name="📋  Round Pairings", value="\n".join(lines), inline=False)
+        else:
+            # Legacy fallback: single mission_code
+            m = db_get_mission(event["mission_code"])
+            embed.add_field(name="Mission",    value=f"**{m.get('name', '—')}**",           inline=True)
+            embed.add_field(name="Deployment", value=f"*{m.get('deployment', '—')}*",        inline=True)
+            embed.add_field(name="Layouts",    value=", ".join(m.get("layouts", [])) or "—", inline=False)
+    else:
+        layouts  = event.get("event_layouts")  or []
+        missions = event.get("event_missions") or []
+        layout_str  = ", ".join(f"Layout {l}" for l in layouts)  if layouts  else "⚠️ not configured"
+        mission_str = ", ".join(missions)                          if missions else "⚠️ not configured"
+        embed.add_field(name="🗺️  Layout pool",  value=layout_str,  inline=False)
+        embed.add_field(name="🎯  Mission pool", value=mission_str, inline=False)
+        embed.add_field(
+            name="ℹ️  Selection",
+            value="Captains choose layout and mission each round via the ritual.",
+            inline=False,
+        )
 
     scoring = (
         "**Primary:** Secure objectives as per mission rules\n"
@@ -211,31 +238,54 @@ def build_event_announcement_embed(event: dict) -> discord.Embed:
     multi  = sd != ed
     dstr   = (f"{sd.strftime('%a %d %b')} — {ed.strftime('%a %d %b %Y')}"
               if multi else sd.strftime("%A %d %B %Y"))
-    total_rounds = calculate_rounds(event["max_players"])
+    total_rounds = event.get("round_count", 3)
+    fmt = event.get("format", "singles")
+    fmt_label = {
+        "singles": "Singles", "2v2": "2v2",
+        "teams_3": "Teams 3s", "teams_5": "Teams 5s", "teams_8": "Teams 8s",
+    }.get(fmt, "Singles")
 
     embed = discord.Embed(
         title=f"🏆  {event['name']}",
         description=(
             f"**Warhammer 40,000 · Tabletop Simulator · Swiss Tournament**\n"
+            f"**{fmt_label}  ·  {event['points_limit']} pts  ·  {total_rounds} rounds**\n"
             f"{SEP}"
         ),
         color=COLOUR_GOLD,
     )
-    embed.add_field(name="📅  Date",     value=dstr,                                 inline=True)
-    embed.add_field(name="⚔️  Points",   value=f"**{event['points_limit']} pts**",   inline=True)
-    embed.add_field(name="👥  Players",  value=f"Max **{event['max_players']}**",     inline=True)
-    embed.add_field(
-        name="🗺️  Mission",
-        value=f"**{m.get('name','—')}**\n*{m.get('deployment','—')}*\nLayouts: {', '.join(m.get('layouts',[]))}",
-        inline=False,
-    )
-    embed.add_field(
-        name="🎲  Format",
-        value=f"Swiss · **{total_rounds} rounds** · {event['rounds_per_day']}/day",
-        inline=True,
-    )
+    embed.add_field(name="📅  Date",     value=dstr,                              inline=True)
+    embed.add_field(name="👥  Players",  value=f"Max **{event['max_players']}**", inline=True)
+    embed.add_field(name="🎲  Schedule", value=f"{total_rounds} rounds · {event['rounds_per_day']}/day", inline=True)
+
+    # Mission / layout block — format-dependent
+    if fmt in ("singles", "2v2"):
+        pairings = event.get("event_pairings") or []
+        if pairings:
+            lines = [f"R{i+1}  ·  Layout **{p['layout']}**  ·  {p['mission']}" for i, p in enumerate(pairings)]
+            embed.add_field(
+                name=f"🗺️  Round Pairings ({len(pairings)} rounds)",
+                value="\n".join(lines),
+                inline=False,
+            )
+        else:
+            # Fallback: show single mission as before
+            embed.add_field(
+                name="🗺️  Mission",
+                value=f"**{m.get('name','—')}**\n*{m.get('deployment','—')}*\nLayouts: {', '.join(m.get('layouts',[]))}",
+                inline=False,
+            )
+    else:
+        # Team formats: show pools
+        layouts  = event.get("event_layouts") or []
+        missions = event.get("event_missions") or []
+        layout_str  = ", ".join(f"Layout {l}" for l in layouts)  if layouts  else "⚠️ not set"
+        mission_str = ", ".join(missions)                          if missions else "⚠️ not set"
+        embed.add_field(name="🗺️  Layout pool",  value=layout_str,  inline=True)
+        embed.add_field(name="🎯  Mission pool", value=mission_str, inline=True)
+
     if event.get("terrain_layout"):
-        embed.add_field(name="🏗️  Terrain", value=event["terrain_layout"], inline=True)
+        embed.add_field(name="🏗️  Terrain", value=event["terrain_layout"], inline=False)
     embed.set_thumbnail(url="https://emojicdn.elk.sh/🏆?style=twitter")
     embed.set_footer(text="Express interest below  ·  List submission required to confirm your spot")
     return embed
@@ -335,7 +385,7 @@ def build_spectator_dashboard_embed(
 
     rounds       = db_get_rounds(event["event_id"])
     done_rounds  = sum(1 for r in rounds if r["state"] == RndS.COMPLETE)
-    total_rounds = calculate_rounds(event["max_players"])
+    total_rounds = event.get("round_count", 3)
 
     # ── Title + status ────────────────────────────────────────────────────
     if round_obj:
@@ -387,7 +437,7 @@ def build_standings_embed(event: dict, standings: List[dict], final: bool = Fals
 
     rounds       = db_get_rounds(event["event_id"])
     done_rounds  = sum(1 for r in rounds if r["state"] == RndS.COMPLETE)
-    total_rounds = calculate_rounds(event["max_players"])
+    total_rounds = event.get("round_count", 3)
     p_results    = db_get_results_by_player(event["event_id"])
 
     table = _standings_table(standings, done_rounds, p_results, include_totals=True)
@@ -435,7 +485,7 @@ def build_team_standings_embed(event: dict, standings: List[dict], final: bool =
     if not final:
         rounds = db_get_rounds(event["event_id"])
         done   = sum(1 for r in rounds if r["state"] == RndS.COMPLETE)
-        total  = calculate_rounds(event["max_players"])
+        total  = event.get("round_count", 3)
         embed.set_footer(text=f"Round {done}/{total}  ·  Primary: Tournament Points  ·  Secondary: Game Points")
     else:
         embed.set_footer(text="Tournament complete")
