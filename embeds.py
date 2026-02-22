@@ -47,10 +47,13 @@ def vp_bar(vp: int, max_vp: int = 120, width: int = 10) -> str:
 def _round_slot(round_data: dict | None) -> str:
     """
     Raw slot string before right-justification.
-    Max 4 chars: "100W", "100L", "100D".
-    "-" only for a game that existed in a completed round but has no confirmed result.
+    Format: "<vp><result>" e.g. "85W", "42L", "60D".
+    Max 4 chars ("100W"). Returns "-" when game is unconfirmed or missing.
+
+    Expects round_data = {"vp": int | None, "result": "W"|"L"|"D"|None}
+    as produced by db_get_results_by_player.
     """
-    if not round_data or round_data["vp"] is None:
+    if not round_data or round_data.get("vp") is None:
         return "-"
     vp     = round_data["vp"]
     result = round_data.get("result") or ""
