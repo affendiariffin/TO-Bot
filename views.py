@@ -33,7 +33,7 @@ from config import (COLOUR_GOLD, COLOUR_CRIMSON, COLOUR_AMBER, COLOUR_SLATE,
                     fe, room_colour)
 from state import GS, RS, JCS, ES, is_to, get_thread_reg, get_judges_for_guild
 from database import *
-from threads import ensure_submissions_thread, calculate_rounds
+from threads import ensure_submissions_thread, event_round_count
 
 # Lazy imports to avoid circular dependencies (services imports from views)
 def _get_refresh_spectator_dashboard():
@@ -98,7 +98,7 @@ class EventAnnouncementView(ui.View):
         embed.add_field(name="Layouts",    value=", ".join(m.get("layouts", [])),                       inline=True)
         embed.add_field(name="Points",     value=f"{event['points_limit']} pts",                         inline=True)
         embed.add_field(name="Max Players",value=str(event["max_players"]),                              inline=True)
-        embed.add_field(name="Rounds",     value=f"{calculate_rounds(event['max_players'])} total · {event['rounds_per_day']}/day", inline=True)
+        embed.add_field(name="Rounds",     value=f"{event_round_count(event)} total · {event['rounds_per_day']}/day", inline=True)
         if event.get("terrain_layout"):
             embed.add_field(name="Terrain Layout", value=event["terrain_layout"], inline=False)
         await interaction.response.send_message(embed=embed, ephemeral=True)
