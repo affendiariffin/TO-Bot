@@ -133,6 +133,7 @@ async def before_loops():
 @bot.event
 async def on_ready():
     init_db()
+    init_factions_cache()
     # Wire bot reference into command modules that need it
     commands_event.init(bot)
     guild = bot.get_guild(GUILD_ID)
