@@ -33,7 +33,9 @@ from config import (COLOUR_GOLD, COLOUR_CRIMSON, COLOUR_AMBER, COLOUR_SLATE,
                     fe, room_colour)
 from state import GS, RS, JCS, ES, TS, is_to, get_thread_reg, get_judges_for_guild
 from database import *
-from threads import ensure_submissions_thread, event_round_count
+from threads import (ensure_submissions_thread, event_round_count,
+                     wtc_gp, wtc_team_result_pair, ntl_team_result,
+                     db_apply_team_result)
 
 # Lazy imports to avoid circular dependencies (services imports from views)
 def _get_refresh_spectator_dashboard():
@@ -1017,12 +1019,17 @@ class ResultModal(ui.Modal, title="Submit Game Result"):
         p2_vp = vp_opp if self.is_player1 else vp_me
         winner_id = game["player1_id"] if p1_vp >= p2_vp else game["player2_id"]
 
+        # Calculate WTC GP from the VP differential (always stored; used for WTC-mode events)
+        p1_wtc_gp, p2_wtc_gp = wtc_gp(p1_vp, p2_vp)
+
         db_update_game(self.game_id, {
-            "player1_vp":   p1_vp,
-            "player2_vp":   p2_vp,
-            "winner_id":    winner_id,
-            "state":        GS.SUBMITTED,
-            "submitted_at": datetime.utcnow(),
+            "player1_vp":     p1_vp,
+            "player2_vp":     p2_vp,
+            "winner_id":      winner_id,
+            "state":          GS.SUBMITTED,
+            "submitted_at":   datetime.utcnow(),
+            "player1_wtc_gp": p1_wtc_gp,
+            "player2_wtc_gp": p2_wtc_gp,
         })
 
         winner_name = game["player1_username"] if winner_id == game["player1_id"] else game["player2_username"]
@@ -1036,6 +1043,13 @@ class ResultModal(ui.Modal, title="Submit Game Result"):
         if not sub_target:
             sub_target = interaction.guild.get_channel(EVENT_NOTICEBOARD_ID)
         if sub_target:
+            # Check if this is a WTC-mode event to display WTC GP in the card
+            event = db_get_event(self.event_id)
+            is_wtc_mode = (event or {}).get("scoring_mode") == "wtc"
+            score_display = f"**{p1_vp} — {p2_vp}**"
+            if is_wtc_mode:
+                score_display += f"\n*(WTC GP: {p1_wtc_gp} — {p2_wtc_gp})*"
+
             embed = discord.Embed(
                 title=f"⏳  Pending Result  —  Room {game['room_number']}",
                 color=COLOUR_AMBER,
@@ -1045,13 +1059,16 @@ class ResultModal(ui.Modal, title="Submit Game Result"):
                 value=f"{fe(game['player1_army'])} *{game['player1_army']}*",
                 inline=True,
             )
-            embed.add_field(name="\u200b", value=f"**{p1_vp} — {p2_vp}**", inline=True)
+            embed.add_field(name="\u200b", value=score_display, inline=True)
             embed.add_field(
                 name=f"🔴 {game['player2_username']}",
                 value=f"{fe(game['player2_army'])} *{game['player2_army']}*",
                 inline=True,
             )
-            embed.add_field(name="🏆  Winner", value=f"**{winner_name}**", inline=False)
+            if p1_vp == p2_vp:
+                embed.add_field(name="🤝  Result", value="**Draw**", inline=False)
+            else:
+                embed.add_field(name="🏆  Winner", value=f"**{winner_name}**", inline=False)
             embed.set_footer(text="Opponent: confirm below  ·  Dispute if incorrect  ·  Auto-confirms in 24h")
             msg = await sub_target.send(
                 embed=embed,
@@ -1070,8 +1087,13 @@ class ResultModal(ui.Modal, title="Submit Game Result"):
             f"{game['player1_username']} {p1_vp}:{p2_vp} {game['player2_username']}",
             self.event_id,
         )
+        is_draw_msg = p1_vp == p2_vp
+        wtc_note = f"\n🎯 WTC GP: **{p1_wtc_gp if self.is_player1 else p2_wtc_gp}** (yours) — **{p2_wtc_gp if self.is_player1 else p1_wtc_gp}** (opponent)"
         await interaction.response.send_message(
-            f"✅ Result submitted!\n**{p1_vp} — {p2_vp}**\nWaiting for opponent confirmation.",
+            f"✅ Result submitted!\n**{vp_me} — {vp_opp}** VP"
+            + (f"\n{'🤝 Draw' if is_draw_msg else f'🏆 Winner: {winner_name}'}")
+            + wtc_note
+            + "\nWaiting for opponent confirmation.",
             ephemeral=True,
         )
 
@@ -1239,6 +1261,38 @@ async def _confirm_game(bot, game_id: str, message: discord.Message, guild: disc
     db_update_game(game_id, {"state": GS.COMPLETE, "confirmed_at": datetime.utcnow()})
     db_apply_result_to_standings(game["event_id"], winner_id, loser_id, p1_vp, p2_vp)
 
+    # ── WTC scoring: accumulate individual WTC GP and update team running total ──
+    event = db_get_event(game["event_id"])
+    is_wtc_mode = (event or {}).get("scoring_mode") == "wtc"
+    p1_wtc_gp = game.get("player1_wtc_gp")
+    p2_wtc_gp = game.get("player2_wtc_gp")
+
+    if is_wtc_mode and p1_wtc_gp is not None and p2_wtc_gp is not None:
+        # Apply WTC GP to individual player standings
+        db_apply_wtc_gp_to_standing(game["event_id"], game["player1_id"], p1_wtc_gp)
+        if game["player2_id"] and game["player2_id"] != "bye":
+            db_apply_wtc_gp_to_standing(game["event_id"], game["player2_id"], p2_wtc_gp)
+
+        # Find the team_round this game belongs to (if any) and update running totals
+        team_round = db_get_team_round_by_game(game_id)
+        if team_round:
+            trid = team_round["team_round_id"]
+            team_a_id = team_round["team_a_id"]
+            team_b_id = team_round["team_b_id"]
+
+            # Determine which GP goes to which team
+            p1_team = db_get_team_id_for_player_in_round(game_id, game["player1_id"])
+            if p1_team == team_a_id:
+                gp_a_delta, gp_b_delta = p1_wtc_gp, p2_wtc_gp
+            else:
+                gp_a_delta, gp_b_delta = p2_wtc_gp, p1_wtc_gp
+
+            db_accumulate_wtc_team_score(trid, team_a_id, gp_a_delta, gp_b_delta)
+
+            # Check if all games in this team_round are now complete → auto-finalize
+            await _maybe_finalize_wtc_team_round(bot, trid, game["event_id"], guild)
+
+    is_draw = (p1_vp == p2_vp)
     winner_name = game["player1_username"] if winner_id == game["player1_id"] else game["player2_username"]
     col  = room_colour(game.get("room_number"))
     embed = discord.Embed(
@@ -1246,18 +1300,91 @@ async def _confirm_game(bot, game_id: str, message: discord.Message, guild: disc
         color=col,
     )
     embed.add_field(name=f"🔵 {game['player1_username']}", value=f"{fe(game['player1_army'])}", inline=True)
-    embed.add_field(name="\u200b", value=f"**{p1_vp} — {p2_vp}**", inline=True)
+
+    score_str = f"**{p1_vp} — {p2_vp}**"
+    if is_wtc_mode and p1_wtc_gp is not None:
+        score_str += f"\n*(WTC: {p1_wtc_gp} — {p2_wtc_gp})*"
+    embed.add_field(name="\u200b", value=score_str, inline=True)
     embed.add_field(name=f"🔴 {game['player2_username']}", value=f"{fe(game['player2_army'])}", inline=True)
-    embed.add_field(name="🏆  Winner", value=f"**{winner_name}**", inline=False)
+
+    if is_draw:
+        embed.add_field(name="🤝  Result", value="**Draw**", inline=False)
+    else:
+        embed.add_field(name="🏆  Winner", value=f"**{winner_name}**", inline=False)
     embed.set_footer(text="Confirmed  ·  Results held until event closes, then submitted to Scorebot")
 
     await message.edit(embed=embed, view=None)
     db_queue_log(
         f"Result confirmed: Room {game['room_number']} — "
-        f"{game['player1_username']} {p1_vp}:{p2_vp} {game['player2_username']} → {winner_name}",
+        f"{game['player1_username']} {p1_vp}:{p2_vp} {game['player2_username']}"
+        + (f" → {winner_name}" if not is_draw else " → Draw"),
         game["event_id"],
     )
     await refresh_spectator_dashboard(bot, game["event_id"])
+
+
+async def _maybe_finalize_wtc_team_round(bot, team_round_id: str, event_id: str, guild):
+    """
+    For WTC-mode events: after each game confirms, check if all games in the
+    team_round are complete. If so, compute team results from accumulated WTC GP
+    and post the round result to the noticeboard.
+    """
+    from threads import db_apply_team_result
+    from state import TRS
+
+    tr = db_get_team_round(team_round_id)
+    if not tr or tr["state"] == TRS.COMPLETE:
+        return
+
+    # Collect all game_ids in this team_round via pairings
+    pairings = db_get_team_pairings(team_round_id)
+    game_ids = [p["game_id"] for p in pairings if p.get("game_id")]
+    if not game_ids:
+        return
+
+    games = [db_get_game(gid) for gid in game_ids]
+    if any(g is None or g["state"] != GS.COMPLETE for g in games):
+        return  # Not all games done yet
+
+    # All games confirmed — finalize team round
+    gp_a = tr.get("team_a_score") or 0
+    gp_b = tr.get("team_b_score") or 0
+
+    tp_a, res_a, tp_b, res_b = wtc_team_result_pair(gp_a, gp_b)
+    is_win_a  = tp_a == 2
+    is_draw_a = tp_a == 1
+
+    db_update_team_round(team_round_id, {
+        "team_a_win": is_win_a,
+        "state":      TRS.COMPLETE,
+    })
+
+    db_apply_team_result(event_id, tr["team_a_id"], tp_a, gp_a, gp_a - gp_b, is_win_a, is_draw_a)
+    db_apply_team_result(event_id, tr["team_b_id"], tp_b, gp_b, gp_b - gp_a, tp_b == 2, tp_b == 1)
+
+    team_a = db_get_team(tr["team_a_id"])
+    team_b = db_get_team(tr["team_b_id"]) if tr.get("team_b_id") else None
+
+    icon_a = "🏆" if is_win_a else ("🤝" if is_draw_a else "❌")
+    icon_b = "🏆" if tp_b == 2 else ("🤝" if tp_b == 1 else "❌")
+
+    from config import EVENT_NOTICEBOARD_ID, COLOUR_GOLD, COLOUR_AMBER, COLOUR_CRIMSON
+    ch = guild.get_channel(EVENT_NOTICEBOARD_ID) if guild else None
+    if ch:
+        name_a = team_a["team_name"] if team_a else "Team A"
+        name_b = team_b["team_name"] if team_b else "Team B"
+        col = COLOUR_GOLD if not is_draw_a else COLOUR_AMBER
+        await ch.send(
+            embed=discord.Embed(
+                title="📊 WTC Team Round Result — Auto-Finalized",
+                description=(
+                    f"{icon_a} **{name_a}** — {gp_a} WTC GP  (*{res_a}*, {tp_a} TP)\n"
+                    f"{icon_b} **{name_b}** — {gp_b} WTC GP  (*{res_b}*, {tp_b} TP)\n\n"
+                    f"All {len(games)} individual games confirmed."
+                ),
+                color=col,
+            )
+        )
 
 async def _auto_confirm_after_24h(bot, game_id: str, message: discord.Message, guild: discord.Guild):
     await asyncio.sleep(86400)
