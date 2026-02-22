@@ -25,7 +25,8 @@ from database import *
 from threads import (ensure_round_thread, team_swiss_pair,
                      get_previous_team_pairings, ntl_team_result,
                      event_round_count, db_get_team_standings,
-                     db_upsert_team_standing, db_apply_team_result)
+                     db_upsert_team_standing, db_apply_team_result,
+                     wtc_team_result_pair)
 from embeds import build_team_standings_embed, build_standings_embed
 from views import PairingActionView
 from services import (refresh_spectator_dashboard, ac_active_events, log_immediate)
@@ -255,6 +256,103 @@ class TeamScoreModal(ui.Modal, title="Submit Team Round Scores"):
         db_queue_log(f"Team result: {self.team_name} {gp_a} GP vs {self.opp_name} {gp_b} GP", self.event_id)
 
 
+class WtcTeamScoreModal(ui.Modal, title="Submit WTC Team Round Scores"):
+    """
+    WTC-mode manual score entry. Captains enter each player's VP scores;
+    the bot converts them to WTC GP automatically using the WTC table,
+    sums per team, then determines Win/Tie/Loss via fixed WTC thresholds.
+
+    In most WTC events with individual game submission, this modal is NOT
+    needed — team scores auto-calculate when all games confirm. This modal
+    is a fallback for TOs or captains who need to submit aggregate scores
+    directly (e.g. when individual game submissions were skipped).
+    """
+    score_a = ui.TextInput(label="Your team's WTC GP total", placeholder="e.g. 88", required=True, max_length=3)
+    score_b = ui.TextInput(label="Opponent's WTC GP total",  placeholder="e.g. 72", required=True, max_length=3)
+
+    def __init__(self, team_round_id: str, event_id: str, team_id: str,
+                  team_name: str, opp_name: str, fmt: str):
+        super().__init__(title=f"WTC Scores: {team_name} vs {opp_name}")
+        self.team_round_id = team_round_id
+        self.event_id      = event_id
+        self.team_id       = team_id
+        self.team_name     = team_name
+        self.opp_name      = opp_name
+        self.fmt           = fmt
+        self.score_a.label = f"{team_name} WTC GP total"
+        self.score_b.label = f"{opp_name} WTC GP total"
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            gp_a = int(self.score_a.value.strip())
+            gp_b = int(self.score_b.value.strip())
+            if gp_a < 0 or gp_b < 0:
+                raise ValueError
+        except ValueError:
+            await interaction.response.send_message("❌ Please enter valid non-negative integers.", ephemeral=True)
+            return
+
+        team_sz = FMT.team_size(self.fmt)
+        max_gp  = team_sz * 20
+        if gp_a > max_gp or gp_b > max_gp:
+            await interaction.response.send_message(
+                f"❌ WTC GP cannot exceed the maximum of {max_gp} (team size {team_sz} × 20).",
+                ephemeral=True)
+            return
+
+        tr = db_get_team_round(self.team_round_id)
+        if not tr or tr["state"] == TRS.COMPLETE:
+            await interaction.response.send_message("❌ This team round is already complete.", ephemeral=True)
+            return
+
+        # WTC fixed thresholds (not ratio-scaled)
+        tp_a, res_a, tp_b, res_b = wtc_team_result_pair(gp_a, gp_b)
+        is_win_a  = tp_a == 2
+        is_draw_a = tp_a == 1
+
+        db_update_team_round(self.team_round_id, {
+            "team_a_score": gp_a,
+            "team_b_score": gp_b,
+            "team_a_win":   is_win_a,
+            "state":        TRS.COMPLETE,
+        })
+
+        db_apply_team_result(self.event_id, tr["team_a_id"], tp_a, gp_a, gp_a - gp_b, is_win_a, is_draw_a)
+        db_apply_team_result(self.event_id, tr["team_b_id"], tp_b, gp_b, gp_b - gp_a,
+                              tp_b == 2, tp_b == 1)
+
+        icon_a = "🏆" if is_win_a else ("🤝" if is_draw_a else "❌")
+        icon_b = "🏆" if tp_b == 2 else ("🤝" if tp_b == 1 else "❌")
+
+        # WTC threshold explanation in the result
+        def _threshold_note(gp: int) -> str:
+            if gp > 85:   return f"{gp} GP (>85 → **Win**)"
+            elif gp >= 75: return f"{gp} GP (75–85 → **Tie**)"
+            else:          return f"{gp} GP (<75 → **Loss**)"
+
+        ch = interaction.guild.get_channel(EVENT_NOTICEBOARD_ID) if interaction.guild else None
+        if ch:
+            await ch.send(
+                embed=discord.Embed(
+                    title="📊 WTC Team Round Result",
+                    description=(
+                        f"{icon_a} **{self.team_name}** — {_threshold_note(gp_a)}  ({tp_a} TP)\n"
+                        f"{icon_b} **{self.opp_name}** — {_threshold_note(gp_b)}  ({tp_b} TP)"
+                    ),
+                    color=COLOUR_GOLD if not is_draw_a else COLOUR_AMBER,
+                )
+            )
+
+        await interaction.response.send_message(
+            f"✅ WTC result recorded!\n"
+            f"{icon_a} **{self.team_name}**: {_threshold_note(gp_a)} → {res_a} ({tp_a} TP)\n"
+            f"{icon_b} **{self.opp_name}**: {_threshold_note(gp_b)} → {res_b} ({tp_b} TP)",
+            ephemeral=True,
+        )
+        db_queue_log(
+            f"WTC team result: {self.team_name} {gp_a} GP vs {self.opp_name} {gp_b} GP", self.event_id)
+
+
 @result_team_grp.command(name="submit", description="[Captain/TO] Submit team round scores")
 @app_commands.describe(event_id="The event")
 @app_commands.autocomplete(event_id=ac_active_events)
@@ -289,13 +387,63 @@ async def result_team_submit(interaction: discord.Interaction, event_id: str):
 
     team_a = db_get_team(tr["team_a_id"])
     team_b = db_get_team(tr["team_b_id"])
-    modal  = TeamScoreModal(
+    fmt    = event.get("format", "teams_8")
+    is_wtc = event.get("scoring_mode") == "wtc"
+
+    # WTC mode: individual game submissions auto-accumulate GP and auto-finalize.
+    # Show current WTC GP totals; only open manual modal for TO override.
+    if is_wtc:
+        gp_a = tr.get("team_a_score") or 0
+        gp_b = tr.get("team_b_score") or 0
+        pairings = db_get_team_pairings(tr["team_round_id"])
+        game_ids  = [p["game_id"] for p in pairings if p.get("game_id")]
+        games_done = sum(1 for gid in game_ids
+                         if gid and (db_get_game(gid) or {}).get("state") == "complete")
+        total_games = len(game_ids)
+
+        status_lines = [
+            f"🎯 **WTC Mode** — scores auto-calculate as individual games confirm.",
+            f"📊 Current WTC GP: **{team_a['team_name']}** {gp_a} — {gp_b} **{team_b['team_name']}**",
+            f"🎮 Games confirmed: {games_done}/{total_games}",
+        ]
+        if games_done < total_games:
+            status_lines.append(
+                f"⏳ Waiting for {total_games - games_done} more game(s). "
+                f"Team result will auto-post when all games confirm."
+            )
+        else:
+            status_lines.append("✅ All games confirmed — team result should already be posted.")
+
+        if is_to(interaction):
+            status_lines.append(
+                "\n**[TO Override]** Use the button below to manually enter WTC GP totals."
+            )
+
+        msg = "\n".join(status_lines)
+        if is_to(interaction):
+            # TO can still manually override
+            await interaction.response.send_modal(
+                WtcTeamScoreModal(
+                    team_round_id=tr["team_round_id"],
+                    event_id=event_id,
+                    team_id=team["team_id"] if team else tr["team_a_id"],
+                    team_name=team_a["team_name"],
+                    opp_name=team_b["team_name"],
+                    fmt=fmt,
+                )
+            )
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+        return
+
+    # NTL mode (original flow)
+    modal = TeamScoreModal(
         team_round_id=tr["team_round_id"],
         event_id=event_id,
         team_id=team["team_id"] if team else tr["team_a_id"],
         team_name=team_a["team_name"],
         opp_name=team_b["team_name"],
-        fmt=event.get("format", "teams_8"),
+        fmt=fmt,
     )
     await interaction.response.send_modal(modal)
 
