@@ -73,19 +73,27 @@ async def flush_batch_logs():
         except Exception:
             pass
 
+# Tracks round_ids for which the 10-minute warning has already been sent.
+# Cleared automatically once the round is no longer in_progress.
+_deadline_warned: set = set()
+
 @tasks.loop(minutes=1)
 async def check_round_deadlines():
     from datetime import datetime, timezone, timedelta
     now = datetime.now(timezone.utc)
+    active_round_ids = set()
     for event in db_get_active_events():
         rnd = db_get_current_round(event["event_id"])
         if not rnd or rnd["state"] != "in_progress": continue
+        rid = rnd["round_id"]
+        active_round_ids.add(rid)
         deadline = rnd.get("deadline_at")
         if not deadline: continue
         if deadline.tzinfo is None:
             deadline = deadline.replace(tzinfo=timezone.utc)
         remaining = (deadline - now).total_seconds()
-        if 0 < remaining < 600:
+        if 0 < remaining < 600 and rid not in _deadline_warned:
+            _deadline_warned.add(rid)
             reg = get_thread_reg(event["event_id"])
             rn  = rnd["round_number"]
             tid = reg.get("rounds", {}).get(rn)
@@ -99,6 +107,8 @@ async def check_round_deadlines():
                         )
                     except Exception:
                         pass
+    # Prune stale entries so the set doesn't grow unbounded
+    _deadline_warned.intersection_update(active_round_ids)
 
 @tasks.loop(minutes=5)
 async def refresh_dashboards():
