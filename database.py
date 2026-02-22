@@ -874,15 +874,18 @@ def scorebot_bulk_submit(eid: str, games: List[dict]) -> int:
 
 def db_get_results_by_player(event_id: str) -> dict:
     """
-    Returns {player_id: {round_number: "W" | "L" | "D" | None}}
+    Returns {player_id: {round_number: {"vp": int | None, "result": "W"|"L"|"D"|None}}}
     for every player in the event, across every round.
 
-    "W" = win (including bye)
-    "L" = loss
-    "D" = draw
-    None = game exists but result not yet confirmed (pending/submitted state)
+    "result" values:
+      "W" = win (including bye)
+      "L" = loss
+      "D" = draw
+      None = game exists but not yet confirmed (pending/submitted state)
 
-    Used by the standings table to render per-round colour dots.
+    "vp" is the player's own VP for that game, or None if not yet confirmed.
+
+    Used by the standings table to render per-round VP + result columns.
     """
     with get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -902,7 +905,7 @@ def db_get_results_by_player(event_id: str) -> dict:
             """, (event_id,))
             rows = cur.fetchall()
 
-    # {player_id: {round_num: "W"/"L"/"D"/None}}
+    # {player_id: {round_num: {"vp": int|None, "result": "W"|"L"|"D"|None}}}
     results: dict = {}
 
     for row in rows:
@@ -913,27 +916,27 @@ def db_get_results_by_player(event_id: str) -> dict:
         vp2 = row["player2_vp"]
         st  = row["state"]
 
-        # Bye round — player 1 always wins
+        # Bye round — player 1 always wins; vp awarded at round close
         if row["is_bye"]:
             if p1:
-                results.setdefault(p1, {})[rn] = "W"
+                results.setdefault(p1, {})[rn] = {"vp": vp1, "result": "W"}
             continue
 
         # Confirmed result
         if st == "complete" and vp1 is not None and vp2 is not None:
             if vp1 > vp2:
-                r1, r2 = "W", "L"
+                res1, res2 = "W", "L"
             elif vp2 > vp1:
-                r1, r2 = "L", "W"
+                res1, res2 = "L", "W"
             else:
-                r1 = r2 = "D"
+                res1 = res2 = "D"
         else:
-            # Game exists but not yet confirmed — show nothing (dot stays ➖)
-            r1 = r2 = None
+            # Game exists but not yet confirmed
+            res1 = res2 = None
 
         if p1:
-            results.setdefault(p1, {})[rn] = r1
+            results.setdefault(p1, {})[rn] = {"vp": vp1, "result": res1}
         if p2:
-            results.setdefault(p2, {})[rn] = r2
+            results.setdefault(p2, {})[rn] = {"vp": vp2, "result": res2}
 
     return results
