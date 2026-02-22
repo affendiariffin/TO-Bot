@@ -2,7 +2,10 @@
 config.py — FND TTS Tournament Bot
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Environment config, all Warhammer data (factions, detachments,
-missions, room colours), and small timestamp/colour helpers.
+room colours), and small timestamp/colour helpers.
+
+Note: Missions and layouts are stored in the database, not here.
+See database.db_get_missions() / db_get_mission().
 
 Imported by: virtually every other module.
 
@@ -138,29 +141,6 @@ WARHAMMER_DETACHMENTS = {
     "Other": ["Other"],
 }
 WARHAMMER_ARMIES = sorted([a for a in WARHAMMER_DETACHMENTS if a != "Other"]) + ["Other"]
-
-TOURNAMENT_MISSIONS = {
-    "A": {"name":"Take and Hold",   "deployment":"Tipping Point",       "layouts":["1","2","4","6","7","8"]},
-    "B": {"name":"Supply Drop",     "deployment":"Tipping Point",       "layouts":["1","2","4","6","7","8"]},
-    "C": {"name":"Linchpin",        "deployment":"Tipping Point",       "layouts":["1","2","4","6","7","8"]},
-    "D": {"name":"Scorched Earth",  "deployment":"Tipping Point",       "layouts":["1","2","4","6","7","8"]},
-    "E": {"name":"Take and Hold",   "deployment":"Hammer and Anvil",    "layouts":["1","7","8"]},
-    "F": {"name":"Hidden Supplies", "deployment":"Hammer and Anvil",    "layouts":["1","7","8"]},
-    "G": {"name":"Purge the Foe",   "deployment":"Hammer and Anvil",    "layouts":["1","7","8"]},
-    "H": {"name":"Supply Drop",     "deployment":"Hammer and Anvil",    "layouts":["1","7","8"]},
-    "I": {"name":"Hidden Supplies", "deployment":"Search and Destroy",  "layouts":["1","2","3","4","6"]},
-    "J": {"name":"Linchpin",        "deployment":"Search and Destroy",  "layouts":["1","2","3","4","6"]},
-    "K": {"name":"Scorched Earth",  "deployment":"Search and Destroy",  "layouts":["1","2","3","4","6"]},
-    "L": {"name":"Take and Hold",   "deployment":"Search and Destroy",  "layouts":["1","2","3","4","6"]},
-    "M": {"name":"Purge the Foe",   "deployment":"Crucible of Battle",  "layouts":["1","2","4","6","8"]},
-    "N": {"name":"Hidden Supplies", "deployment":"Crucible of Battle",  "layouts":["1","2","4","6","8"]},
-    "O": {"name":"Terraform",       "deployment":"Crucible of Battle",  "layouts":["1","2","4","6","8"]},
-    "P": {"name":"Scorched Earth",  "deployment":"Crucible of Battle",  "layouts":["1","2","4","6","8"]},
-    "Q": {"name":"Supply Drop",     "deployment":"Sweeping Engagement", "layouts":["3","5"]},
-    "R": {"name":"Terraform",       "deployment":"Sweeping Engagement", "layouts":["3","5"]},
-    "S": {"name":"Linchpin",        "deployment":"Dawn of War",         "layouts":["5"]},
-    "T": {"name":"Purge the Foe",   "deployment":"Dawn of War",         "layouts":["5"]},
-}
 
 GAME_ROOM_PREFIX = "Game Room"
 
