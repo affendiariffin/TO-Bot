@@ -165,11 +165,12 @@ async def event_create(
         f"{calculate_rounds(max_players)} rounds suggested  ·  Announcement posted to #event-noticeboard",
         ephemeral=True,
     )
+    mission_name = mission_obj["name"]
     await log_immediate(
         interaction.client,
         "Event Created",
         f"🏆 **{name}** by {interaction.user.display_name}\n"
-        f"Format: {fmt_label} · Mission {mission}: {mission_obj["name"]} · {ind_pts}pts · {sd}→{ed}",
+        f"Format: {fmt_label} · Mission {mission}: {mission_name} · {ind_pts}pts · {sd}→{ed}",
         COLOUR_GOLD,
     )
 
