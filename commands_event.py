@@ -5,6 +5,8 @@ Slash commands for event lifecycle management (TO only).
 
 Commands (all under /event group):
   • /event create
+  • /event set-layouts
+  • /event set-missions
   • /event open-interest
   • /event open-registration
   • /event lock-lists
@@ -73,6 +75,8 @@ event_grp = app_commands.Group(
     rounds_per_day="Rounds per day",
     terrain_layout="Optional terrain layout notes",
     format="Event format",
+    layouts="Team events: comma-separated layout numbers for this event, max 3 (e.g. 1,4,8)",
+    missions="Team events: comma-separated mission codes for this event, max 3 (e.g. A,C,M)",
 )
 @app_commands.autocomplete(mission=ac_missions)
 @app_commands.choices(format=[
@@ -93,6 +97,8 @@ async def event_create(
     rounds_per_day: int = 3,
     terrain_layout: str = "",
     format: str = "singles",
+    layouts: str = "",
+    missions: str = "",
 ):
     if not is_to(interaction):
         await interaction.response.send_message("❌ TO only.", ephemeral=True); return
@@ -108,6 +114,16 @@ async def event_create(
     if not mission_obj:
         await interaction.followup.send("❌ Invalid mission code.", ephemeral=True); return
 
+    # Parse and validate event layouts and missions (team formats only)
+    event_layouts  = [l.strip() for l in layouts.split(",")  if l.strip()][:3]
+    event_missions = [m.strip() for m in missions.split(",") if m.strip()][:3]
+
+    for code in event_missions:
+        if not db_get_mission(code):
+            await interaction.followup.send(
+                f"❌ Unknown mission code: `{code}`. Check `/mission list`.", ephemeral=True)
+            return
+
     team_sz  = FMT.team_size(format)
     ind_pts  = FMT.individual_points(format)
 
@@ -117,7 +133,10 @@ async def event_create(
         "rounds_per_day": rounds_per_day, "terrain_layout": terrain_layout,
         "created_by": str(interaction.user.id),
     })
-    db_update_event(eid, {"format": format, "team_size": team_sz, "individual_points": ind_pts})
+    db_update_event(eid, {
+        "format": format, "team_size": team_sz, "individual_points": ind_pts,
+        "event_layouts": event_layouts, "event_missions": event_missions,
+    })
 
     event = db_get_event(eid)
     embed = build_event_announcement_embed(event)
@@ -159,12 +178,21 @@ async def event_create(
         "singles": "Singles", "2v2": "2v2",
         "teams_3": "Teams 3s", "teams_5": "Teams 5s", "teams_8": "Teams 8s",
     }.get(format, "Singles")
-    await interaction.followup.send(
+
+    # Build confirmation message, noting layout/mission config for team events
+    confirm = (
         f"✅ **{name}** created — `{eid}`\n"
         f"Format: **{fmt_label}** · {ind_pts}pts per player\n"
-        f"{calculate_rounds(max_players)} rounds suggested  ·  Announcement posted to #event-noticeboard",
-        ephemeral=True,
+        f"{calculate_rounds(max_players)} rounds suggested  ·  Announcement posted to #event-noticeboard"
     )
+    if format in ("teams_3", "teams_5", "teams_8"):
+        layout_str  = ", ".join(f"Layout {l}" for l in event_layouts) if event_layouts else "⚠️ none set"
+        mission_str = ", ".join(event_missions) if event_missions else "⚠️ none set"
+        confirm += f"\n🗺️ Layouts: {layout_str}\n🎯 Missions: {mission_str}"
+        if not event_layouts or not event_missions:
+            confirm += "\n\n⚠️ Use `/event set-layouts` and `/event set-missions` before running the ritual."
+
+    await interaction.followup.send(confirm, ephemeral=True)
     mission_name = mission_obj["name"]
     await log_immediate(
         interaction.client,
@@ -173,6 +201,59 @@ async def event_create(
         f"Format: {fmt_label} · Mission {mission}: {mission_name} · {ind_pts}pts · {sd}→{ed}",
         COLOUR_GOLD,
     )
+
+
+@event_grp.command(name="set-layouts", description="[TO] Set the terrain layouts for a team event (max 3)")
+@app_commands.describe(
+    event_id="The event",
+    layouts="Comma-separated layout numbers, max 3 (e.g. 1,4,8). TO must verify all layout+mission combos are valid beforehand.",
+)
+@app_commands.autocomplete(event_id=ac_active_events)
+async def event_set_layouts(interaction: discord.Interaction, event_id: str, layouts: str):
+    if not is_to(interaction):
+        await interaction.response.send_message("❌ TO only.", ephemeral=True); return
+    event = db_get_event(event_id)
+    if not event:
+        await interaction.response.send_message("❌ Event not found.", ephemeral=True); return
+    parsed = [l.strip() for l in layouts.split(",") if l.strip()][:3]
+    if not parsed:
+        await interaction.response.send_message("❌ Provide at least one layout number.", ephemeral=True); return
+    db_update_event(event_id, {"event_layouts": parsed})
+    await interaction.response.send_message(
+        f"✅ Layouts for **{event['name']}** set to: {', '.join(f'Layout {l}' for l in parsed)}",
+        ephemeral=True,
+    )
+
+
+@event_grp.command(name="set-missions", description="[TO] Set the missions for a team event (max 3)")
+@app_commands.describe(
+    event_id="The event",
+    missions="Comma-separated mission codes, max 3 (e.g. A,C,M). TO must verify all layout+mission combos are valid beforehand.",
+)
+@app_commands.autocomplete(event_id=ac_active_events)
+async def event_set_missions(interaction: discord.Interaction, event_id: str, missions: str):
+    if not is_to(interaction):
+        await interaction.response.send_message("❌ TO only.", ephemeral=True); return
+    event = db_get_event(event_id)
+    if not event:
+        await interaction.response.send_message("❌ Event not found.", ephemeral=True); return
+    parsed = [m.strip() for m in missions.split(",") if m.strip()][:3]
+    if not parsed:
+        await interaction.response.send_message("❌ Provide at least one mission code.", ephemeral=True); return
+    for code in parsed:
+        if not db_get_mission(code):
+            await interaction.response.send_message(
+                f"❌ Unknown mission code: `{code}`. Check `/mission list`.", ephemeral=True)
+            return
+    db_update_event(event_id, {"event_missions": parsed})
+    mission_names = ", ".join(
+        f"`{code}` ({db_get_mission(code).get('name', '?')})" for code in parsed
+    )
+    await interaction.response.send_message(
+        f"✅ Missions for **{event['name']}** set to: {mission_names}",
+        ephemeral=True,
+    )
+
 
 @event_grp.command(name="open-interest", description="Open interest registration")
 @app_commands.autocomplete(event_id=ac_active_events)
