@@ -226,6 +226,126 @@ def build_singles_event_card(
     return embed
 
 
+def build_team_event_card(
+    event: dict,
+    teams: list,
+    deadline_passed: bool = False,
+) -> discord.Embed:
+    """
+    Registration card for 2v2 and team-format events.
+
+    Shows teams in three sections:
+      Confirmed (state==TS.READY)
+      Chop      (state==TS.FORMING)
+      Reserve   (state=="reserve")
+
+    deadline_passed=True: Confirmed section only, no buttons.
+    Each team entry shows the captain name and (once submitted) team name.
+    """
+    from state import TS as _TS
+
+    sd    = event["start_date"]
+    multi = event["start_date"] != event["end_date"]
+    dstr  = (
+        f"{sd.strftime('%a %d %b')} — {event['end_date'].strftime('%a %d %b %Y')}"
+        if multi else sd.strftime("%A %d %B %Y")
+    )
+
+    t_size      = event.get("team_size", 2)
+    round_count = event.get("round_count", 3)
+    day_label   = "1 day" if round_count <= 3 else "2 days"
+    max_teams   = event.get("max_players", 0) // t_size if t_size else "?"
+    fmt_label   = {
+        "2v2":     "2v2",
+        "teams_3": "Teams 3s",
+        "teams_5": "Teams 5s",
+        "teams_8": "Teams 8s",
+    }.get(event.get("format", ""), "Teams")
+
+    confirmed = [t for t in teams if t["state"] == _TS.READY]
+    chop      = [t for t in teams if t["state"] == _TS.FORMING]
+    reserve   = [t for t in teams if t["state"] == "reserve"]
+
+    def _team_line(team, icon=""):
+        return f"{icon} **{team['team_name']}** (captain: {team['captain_username']})"
+
+    embed = discord.Embed(
+        title=f"🏆  {event['name']}",
+        description=(
+            f"**Warhammer 40,000  ·  Tabletop Simulator  ·  {fmt_label}**\n"
+            f"{event['points_limit']} pts  ·  **{round_count} round{'s' if round_count > 1 else ''}**  ·  {day_label}\n"
+            f"{SEP}"
+        ),
+        color=COLOUR_GOLD,
+    )
+    embed.add_field(name="📅  Date",         value=dstr,                       inline=True)
+    embed.add_field(name="👥  Teams",         value=f"{max_teams} teams",       inline=True)
+    embed.add_field(name="🎲  Rounds",        value=f"{round_count} · Swiss",   inline=True)
+    embed.add_field(name="🧑‍🤝‍🧑  Team Size",  value=f"{t_size} players/team",   inline=True)
+
+    # Schedule
+    sched_slots: list = event.get("_schedule_slots") or []
+    if sched_slots:
+        sched_lines = []
+        for s in sched_slots:
+            ts_s = f"<t:{int(s['start_dt'].timestamp())}:t>"
+            ts_e = f"<t:{int(s['end_dt'].timestamp())}:t>"
+            sched_lines.append(f"{s['label']}  {ts_s}–{ts_e}")
+        embed.add_field(name="🕗  Schedule (KL time)", value="\n".join(sched_lines), inline=False)
+    else:
+        embed.add_field(name="🕗  Start Time", value=f"**8:30am KL time** on {dstr}", inline=False)
+
+    # Key dates
+    from datetime import datetime as _dtm
+    rules_cutoff = event.get("_rules_cutoff") or event.get("rules_cutoff")
+    reg_deadline = event.get("_reg_deadline") or event.get("reg_deadline")
+    date_lines: list[str] = []
+    for label, val in [("📋  Rules cutoff", rules_cutoff), ("⏰  Registration closes", reg_deadline)]:
+        if not val:
+            continue
+        if isinstance(val, str):
+            try:
+                val = _dtm.strptime(val, "%Y-%m-%d").date()
+            except Exception:
+                continue
+        date_lines.append(f"{label}: **{val.strftime('%a %d %b %Y')}**")
+    if date_lines:
+        embed.add_field(name="📅  Key Dates", value="\n".join(date_lines), inline=False)
+
+    # Registration sections
+    if not deadline_passed:
+        embed.add_field(
+            name=f"✅  Confirmed  ({len(confirmed)}/{max_teams})",
+            value="\n".join(_team_line(t, "✅") for t in confirmed) or "*None yet*",
+            inline=False,
+        )
+        embed.add_field(
+            name=f"✊  Chop  ({len(chop)})",
+            value="\n".join(_team_line(t, "✊") for t in chop) or "*None yet*",
+            inline=True,
+        )
+        embed.add_field(
+            name=f"🖐️  Reserve  ({len(reserve)})",
+            value="\n".join(_team_line(t, "🖐️") for t in reserve) or "*None yet*",
+            inline=True,
+        )
+        embed.set_footer(
+            text=(
+                "Captain: click Chop ✊ to register your team and submit all lists  ·  "
+                "TO reviews and confirms your spot  ·  Lists are private until deadline"
+            )
+        )
+    else:
+        embed.add_field(
+            name=f"✅  Confirmed Teams  ({len(confirmed)}/{max_teams})",
+            value="\n".join(_team_line(t, "✅") for t in confirmed) or "*None*",
+            inline=False,
+        )
+        embed.set_footer(text="Registration closed · Army lists published in the thread above")
+
+    return embed
+
+
 def build_event_main_embed(event: dict, regs: list) -> discord.Embed:
     """
     Card 1 — Event Main Details.
