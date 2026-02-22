@@ -20,6 +20,7 @@ Imported by: threads.py, views.py, services.py, commands_*.py, ritual.py
 """
 import psycopg2, psycopg2.extras
 import uuid
+import json as _json
 from datetime import datetime, date, timezone
 from typing import List, Optional, Dict
 from config import DATABASE_URL
@@ -27,6 +28,22 @@ from state import ES, RndS, GS, JCS, TS, TRS, PS  # FIX: added missing import (N
 
 def get_conn():
     return psycopg2.connect(DATABASE_URL, sslmode="require")
+
+
+def _parse_event_row(r) -> dict:
+    """Deserialise JSON list columns on an event row."""
+    d = dict(r)
+    for col in ("event_layouts", "event_missions"):
+        raw = d.get(col)
+        if isinstance(raw, str):
+            try:
+                d[col] = _json.loads(raw)
+            except Exception:
+                d[col] = []
+        elif raw is None:
+            d[col] = []
+    return d
+
 
 def init_db():
     with get_conn() as conn:
@@ -53,7 +70,7 @@ def init_db():
                     created_at           TIMESTAMP NOT NULL DEFAULT NOW()
                 )
             """)
-            # Add thread columns if upgrading from v2
+            # Add columns if upgrading from earlier versions
             for col in ("submissions_thread_id", "lists_thread_id"):
                 cur.execute(f"""
                     ALTER TABLE tournament_events ADD COLUMN IF NOT EXISTS {col} TEXT
@@ -188,6 +205,8 @@ def init_db():
                 "captains_thread_id TEXT",
                 "pairing_room_thread_id TEXT",
                 "standings_msg_id TEXT",   # FIX: added missing column used by refresh_standings_card
+                "event_layouts TEXT",      # JSON array of layout numbers e.g. '["1","4","8"]'
+                "event_missions TEXT",     # JSON array of mission codes  e.g. '["A","C","M"]'
             ):
                 cur.execute(f"ALTER TABLE tournament_events ADD COLUMN IF NOT EXISTS {col_def}")
 
@@ -376,27 +395,32 @@ def db_get_event(eid: str) -> Optional[dict]:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("SELECT * FROM tournament_events WHERE event_id=%s", (eid,))
             r = cur.fetchone()
-    return dict(r) if r else None
+    return _parse_event_row(r) if r else None
 
 def db_get_active_events() -> List[dict]:
     with get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("SELECT * FROM tournament_events WHERE state!='complete' ORDER BY start_date")
-            return [dict(r) for r in cur.fetchall()]
+            return [_parse_event_row(r) for r in cur.fetchall()]
 
 def db_get_all_events() -> List[dict]:
     with get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("SELECT * FROM tournament_events ORDER BY start_date DESC LIMIT 25")
-            return [dict(r) for r in cur.fetchall()]
+            return [_parse_event_row(r) for r in cur.fetchall()]
 
 def db_update_event(eid: str, updates: dict):
     if not updates: return
-    fields = ", ".join(f"{k}=%s" for k in updates)
+    # Serialise list columns to JSON before writing
+    serialised = dict(updates)
+    for col in ("event_layouts", "event_missions"):
+        if col in serialised and isinstance(serialised[col], list):
+            serialised[col] = _json.dumps(serialised[col])
+    fields = ", ".join(f"{k}=%s" for k in serialised)
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(f"UPDATE tournament_events SET {fields} WHERE event_id=%s",
-                        list(updates.values()) + [eid])
+                        list(serialised.values()) + [eid])
             conn.commit()
 
 # ── Registrations ─────────────────────────────────────────────────────────────
