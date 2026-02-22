@@ -20,9 +20,10 @@ Imported by: threads.py, views.py, services.py, commands_*.py, ritual.py
 """
 import psycopg2, psycopg2.extras
 import uuid
-from datetime import datetime, date  # FIX: added `date` (used in scorebot_get_season_id)
+from datetime import datetime, date, timezone
 from typing import List, Optional, Dict
 from config import DATABASE_URL
+from state import ES, RndS, GS, JCS, TS, TRS, PS  # FIX: added missing import (NameError at runtime without this)
 
 def get_conn():
     return psycopg2.connect(DATABASE_URL, sslmode="require")
@@ -528,36 +529,66 @@ def db_update_standing(eid: str, pid: str, updates: dict):
             conn.commit()
 
 def db_apply_result_to_standings(eid: str, winner_id: str, loser_id: str, winner_vp: int, loser_vp: int):
+    # FIX: detect draws (equal VP) and increment draws column instead of wins/losses
+    is_draw = (winner_vp == loser_vp)
     with get_conn() as conn:
         with conn.cursor() as cur:
             if winner_id and winner_id != "bye":
-                cur.execute("""UPDATE tournament_standings SET
-                    wins=wins+1, vp_total=vp_total+%s, vp_against=vp_against+%s, vp_diff=vp_diff+%s
-                    WHERE event_id=%s AND player_id=%s""",
-                    (winner_vp, loser_vp, winner_vp - loser_vp, eid, winner_id))
+                if is_draw:
+                    cur.execute("""UPDATE tournament_standings SET
+                        draws=draws+1, vp_total=vp_total+%s, vp_against=vp_against+%s, vp_diff=vp_diff+%s
+                        WHERE event_id=%s AND player_id=%s""",
+                        (winner_vp, loser_vp, 0, eid, winner_id))
+                else:
+                    cur.execute("""UPDATE tournament_standings SET
+                        wins=wins+1, vp_total=vp_total+%s, vp_against=vp_against+%s, vp_diff=vp_diff+%s
+                        WHERE event_id=%s AND player_id=%s""",
+                        (winner_vp, loser_vp, winner_vp - loser_vp, eid, winner_id))
             if loser_id and loser_id != "bye":
-                cur.execute("""UPDATE tournament_standings SET
-                    losses=losses+1, vp_total=vp_total+%s, vp_against=vp_against+%s, vp_diff=vp_diff+%s
-                    WHERE event_id=%s AND player_id=%s""",
-                    (loser_vp, winner_vp, loser_vp - winner_vp, eid, loser_id))
+                if is_draw:
+                    cur.execute("""UPDATE tournament_standings SET
+                        draws=draws+1, vp_total=vp_total+%s, vp_against=vp_against+%s, vp_diff=vp_diff+%s
+                        WHERE event_id=%s AND player_id=%s""",
+                        (loser_vp, winner_vp, 0, eid, loser_id))
+                else:
+                    cur.execute("""UPDATE tournament_standings SET
+                        losses=losses+1, vp_total=vp_total+%s, vp_against=vp_against+%s, vp_diff=vp_diff+%s
+                        WHERE event_id=%s AND player_id=%s""",
+                        (loser_vp, winner_vp, loser_vp - winner_vp, eid, loser_id))
             conn.commit()
 
 def db_reverse_result_from_standings(eid: str, winner_id: str, loser_id: str, winner_vp: int, loser_vp: int):
     """Undo a previously applied result (used by adjust command)."""
+    # FIX: detect draws so we reverse the correct column (draws vs wins/losses)
+    is_draw = (winner_vp == loser_vp)
     with get_conn() as conn:
         with conn.cursor() as cur:
             if winner_id and winner_id != "bye":
-                cur.execute("""UPDATE tournament_standings SET
-                    wins=GREATEST(0,wins-1), vp_total=GREATEST(0,vp_total-%s),
-                    vp_against=GREATEST(0,vp_against-%s), vp_diff=vp_diff-%s
-                    WHERE event_id=%s AND player_id=%s""",
-                    (winner_vp, loser_vp, winner_vp - loser_vp, eid, winner_id))
+                if is_draw:
+                    cur.execute("""UPDATE tournament_standings SET
+                        draws=GREATEST(0,draws-1), vp_total=GREATEST(0,vp_total-%s),
+                        vp_against=GREATEST(0,vp_against-%s), vp_diff=vp_diff-%s
+                        WHERE event_id=%s AND player_id=%s""",
+                        (winner_vp, loser_vp, 0, eid, winner_id))
+                else:
+                    cur.execute("""UPDATE tournament_standings SET
+                        wins=GREATEST(0,wins-1), vp_total=GREATEST(0,vp_total-%s),
+                        vp_against=GREATEST(0,vp_against-%s), vp_diff=vp_diff-%s
+                        WHERE event_id=%s AND player_id=%s""",
+                        (winner_vp, loser_vp, winner_vp - loser_vp, eid, winner_id))
             if loser_id and loser_id != "bye":
-                cur.execute("""UPDATE tournament_standings SET
-                    losses=GREATEST(0,losses-1), vp_total=GREATEST(0,vp_total-%s),
-                    vp_against=GREATEST(0,vp_against-%s), vp_diff=vp_diff-%s
-                    WHERE event_id=%s AND player_id=%s""",
-                    (loser_vp, winner_vp, loser_vp - winner_vp, eid, loser_id))
+                if is_draw:
+                    cur.execute("""UPDATE tournament_standings SET
+                        draws=GREATEST(0,draws-1), vp_total=GREATEST(0,vp_total-%s),
+                        vp_against=GREATEST(0,vp_against-%s), vp_diff=vp_diff-%s
+                        WHERE event_id=%s AND player_id=%s""",
+                        (loser_vp, winner_vp, 0, eid, loser_id))
+                else:
+                    cur.execute("""UPDATE tournament_standings SET
+                        losses=GREATEST(0,losses-1), vp_total=GREATEST(0,vp_total-%s),
+                        vp_against=GREATEST(0,vp_against-%s), vp_diff=vp_diff-%s
+                        WHERE event_id=%s AND player_id=%s""",
+                        (loser_vp, winner_vp, loser_vp - winner_vp, eid, loser_id))
             conn.commit()
 
 # ── Judge calls ───────────────────────────────────────────────────────────────
@@ -806,7 +837,7 @@ def db_get_pairing_state(team_round_id: str) -> Optional[dict]:
 
 def db_update_pairing_state(team_round_id: str, updates: dict):
     if not updates: return
-    updates["updated_at"] = datetime.utcnow()
+    updates["updated_at"] = datetime.now(timezone.utc)  # FIX: use timezone-aware datetime
     fields = ", ".join(f"{k}=%s" for k in updates)
     with get_conn() as conn:
         with conn.cursor() as cur:
