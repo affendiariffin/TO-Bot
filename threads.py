@@ -8,7 +8,7 @@ Sections:
   • ensure_submissions_thread / ensure_lists_thread / ensure_round_thread
   • add_player_to_event_threads / archive_event_threads
   • restore_thread_registry
-  • Swiss pairing: calculate_rounds, get_previous_pairings, swiss_pair
+  • Swiss pairing: event_round_count, get_previous_pairings, swiss_pair
   • assign_rooms, team Swiss pairing
   • Scoring formulas: ntl_gp, ntl_team_result, twovtwo_team_result
   • db_get_team_standings / db_upsert_team_standing / db_apply_team_result
@@ -257,12 +257,16 @@ async def restore_thread_registry(bot, guild: discord.Guild):
                 reg["rounds"][rnd["round_number"]] = int(rnd["round_thread_id"])
     print("✅ Thread registry restored")
 
-def calculate_rounds(player_count: int) -> int:
-    if player_count <= 4:  return 2
-    if player_count <= 8:  return 3
-    if player_count <= 16: return 4
-    if player_count <= 32: return 5
-    return 6
+def event_round_count(event: dict) -> int:
+    """
+    Return the total number of rounds for this event.
+    Always 3 or 5 — set explicitly by the TO at event creation and stored in event['round_count'].
+    Falls back to 3 if somehow missing (e.g. legacy rows before the column existed).
+    """
+    rc = event.get("round_count")
+    if rc in (3, 5):
+        return rc
+    return 3
 
 def get_previous_pairings(eid: str) -> set:
     pairs = set()
