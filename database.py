@@ -940,3 +940,65 @@ def db_get_results_by_player(event_id: str) -> dict:
             results.setdefault(p2, {})[rn] = {"vp": vp2, "result": res2}
 
     return results
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FACTIONS CACHE
+# ══════════════════════════════════════════════════════════════════════════════
+
+_factions_cache:    dict[str, dict] = {}
+_detachments_cache: dict[str, list] = {}
+
+
+def init_factions_cache():
+    """
+    Load all active factions and their detachments from DB into memory.
+    Call once at startup. Re-call after DB edits via /faction reload.
+    """
+    global _factions_cache, _detachments_cache
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                SELECT army_name, emoji, colour_r, colour_g, colour_b, sort_order
+                FROM warhammer_factions
+                WHERE active = TRUE
+                ORDER BY sort_order, army_name
+            """)
+            factions = cur.fetchall()
+            cur.execute("""
+                SELECT army_name, detachment_name
+                FROM warhammer_detachments
+                WHERE active = TRUE
+                ORDER BY army_name, sort_order, detachment_name
+            """)
+            detachments = cur.fetchall()
+
+    _factions_cache = {
+        r["army_name"]: {
+            "emoji":      r["emoji"],
+            "colour":     (r["colour_r"], r["colour_g"], r["colour_b"]),
+            "sort_order": r["sort_order"],
+        }
+        for r in factions
+    }
+    _detachments_cache = {}
+    for r in detachments:
+        _detachments_cache.setdefault(r["army_name"], []).append(r["detachment_name"])
+
+    print(f"✅ Factions cache loaded ({len(_factions_cache)} factions, "
+          f"{sum(len(v) for v in _detachments_cache.values())} detachments)")
+    return _factions_cache, _detachments_cache
+
+
+def db_get_faction(army_name: str) -> dict:
+    """Return {emoji, colour, sort_order} for a faction, or {} if not found."""
+    return _factions_cache.get(army_name, {})
+
+
+def db_get_factions() -> dict[str, dict]:
+    """Return full {army_name: {emoji, colour, sort_order}} mapping (sorted)."""
+    return _factions_cache
+
+
+def db_get_army_names() -> list[str]:
+    """Return sorted list of army names. Replaces WARHAMMER_ARMIES."""
+    return list(_factions_cache.keys())   # already sorted by sort_order from query
