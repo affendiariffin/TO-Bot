@@ -31,7 +31,7 @@ from typing import Optional
 from config import (COLOUR_GOLD, COLOUR_CRIMSON, COLOUR_AMBER, COLOUR_SLATE,
                     CREW_ROLE_ID, EVENT_NOTICEBOARD_ID,
                     fe, room_colour)
-from state import GS, RS, JCS, ES, is_to, get_thread_reg, get_judges_for_guild
+from state import GS, RS, JCS, ES, TS, is_to, get_thread_reg, get_judges_for_guild
 from database import *
 from threads import ensure_submissions_thread, event_round_count
 
@@ -303,6 +303,295 @@ class ChopListSubmissionModal(ui.Modal, title="Submit Your Army List"):
             f"Status: **{status_label}**\n"
             f"Army: **{self.army.value.strip()}** · *{self.detachment.value.strip()}*\n"
             f"The TO will review your list in your private thread. Watch for a DM when confirmed.",
+            ephemeral=True,
+        )
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TEAM EVENT VIEWS  —  2v2, Teams 3s/5s/8s
+# ══════════════════════════════════════════════════════════════════════════════
+
+_team_withdraw_count: dict[int, int] = {}
+
+
+class TeamChopRegistrationView(ui.View):
+    """
+    Persistent view on the team event card.
+    Captain clicks Chop to register their team.
+    """
+    def __init__(self, event_id: str):
+        super().__init__(timeout=None)
+        self.event_id = event_id
+
+    @ui.button(label="\u270a  Chop", style=discord.ButtonStyle.success,
+               custom_id="team_reg_chop", row=0)
+    async def btn_chop(self, interaction: discord.Interaction, button: ui.Button):
+        from commands_event import refresh_team_event_card
+        event = db_get_event(self.event_id)
+        if not event:
+            await interaction.response.send_message("\u274c Event not found.", ephemeral=True)
+            return
+        if event["state"] not in (ES.ANNOUNCED, ES.INTEREST, ES.REGISTRATION):
+            await interaction.response.send_message(
+                "\u274c Registration is not currently open.", ephemeral=True)
+            return
+
+        # Only one team per captain per event
+        existing = db_get_team_by_captain(self.event_id, str(interaction.user.id))
+        if existing and existing["state"] not in (TS.DROPPED,):
+            state_label = {"forming": "Chop", "ready": "Confirmed", "reserve": "Reserve"}.get(
+                existing["state"], existing["state"])
+            await interaction.response.send_message(
+                f"\u2139\ufe0f You already have a team registered as **{state_label}** for this event.\n"
+                f"Use your private thread to update your lists, or click **Withdraw** to drop out.",
+                ephemeral=True)
+            return
+
+        # Check if Chop slots are full (confirmed + chop >= max_teams)
+        t_size    = event.get("team_size", 2)
+        max_teams = event.get("max_players", 0) // t_size if t_size else 0
+        all_teams = db_get_teams(self.event_id)
+        active_count = sum(1 for t in all_teams if t["state"] in (TS.FORMING, TS.READY))
+        if active_count >= max_teams:
+            await interaction.response.send_message(
+                f"\u2139\ufe0f Chop slots are full ({active_count}/{max_teams} teams).\n"
+                f"Click **Reserve \U0001f91a** to join the waitlist.",
+                ephemeral=True)
+            return
+
+        await interaction.response.send_modal(TeamChopModal(self.event_id, as_reserve=False))
+
+    @ui.button(label="\U0001f91a  Reserve", style=discord.ButtonStyle.primary,
+               custom_id="team_reg_reserve", row=0)
+    async def btn_reserve(self, interaction: discord.Interaction, button: ui.Button):
+        event = db_get_event(self.event_id)
+        if not event:
+            await interaction.response.send_message("\u274c Event not found.", ephemeral=True)
+            return
+        if event["state"] not in (ES.ANNOUNCED, ES.INTEREST, ES.REGISTRATION):
+            await interaction.response.send_message(
+                "\u274c Registration is not currently open.", ephemeral=True)
+            return
+
+        existing = db_get_team_by_captain(self.event_id, str(interaction.user.id))
+        if existing and existing["state"] in (TS.FORMING, TS.READY):
+            state_label = "Chop" if existing["state"] == TS.FORMING else "Confirmed"
+            await interaction.response.send_message(
+                f"\u2139\ufe0f Your team is already registered as **{state_label}**. "
+                f"Contact the TO if you need to update your lists.",
+                ephemeral=True)
+            return
+        # "reserve" state or dropped can re-open the modal
+        await interaction.response.send_modal(TeamChopModal(self.event_id, as_reserve=True))
+
+    @ui.button(label="\U0001f6aa  Withdraw", style=discord.ButtonStyle.secondary,
+               custom_id="team_reg_withdraw", row=0)
+    async def btn_withdraw(self, interaction: discord.Interaction, button: ui.Button):
+        from commands_event import refresh_team_event_card
+        event = db_get_event(self.event_id)
+        team  = db_get_team_by_captain(self.event_id, str(interaction.user.id))
+        if not team or team["state"] == TS.DROPPED:
+            await interaction.response.send_message(
+                "\u274c You don't have an active team registration for this event.", ephemeral=True)
+            return
+
+        was_chop_or_confirmed = team["state"] in (TS.FORMING, TS.READY)
+        db_update_team(team["team_id"], {"state": TS.DROPPED})
+
+        # Close captain thread
+        tid = team.get("captains_thread_id")
+        if tid:
+            t = interaction.guild.get_thread(int(tid))
+            if t:
+                try:
+                    await t.send("\U0001f44b Team has withdrawn. This thread is now closed.")
+                    await t.edit(archived=True, locked=True)
+                except Exception:
+                    pass
+
+        # Promote oldest reserve team
+        if was_chop_or_confirmed:
+            all_teams    = db_get_teams(self.event_id)
+            reserve_list = sorted(
+                [t for t in all_teams if t["state"] == "reserve" and t["team_id"] != team["team_id"]],
+                key=lambda t: t.get("created_at") or datetime.min,
+            )
+            if reserve_list:
+                promoted = reserve_list[0]
+                db_update_team(promoted["team_id"], {"state": TS.FORMING})
+                try:
+                    cap = await interaction.client.fetch_user(int(promoted["captain_id"]))
+                    await cap.send(
+                        f"\U0001f389 **Team '{promoted['team_name']}' promoted from Reserve to Chop "
+                        f"for {event['name']}!**\nA spot opened up. The TO will review your lists shortly."
+                    )
+                except Exception:
+                    pass
+                ptid = promoted.get("captains_thread_id")
+                if ptid:
+                    pt = interaction.guild.get_thread(int(ptid))
+                    if pt:
+                        try:
+                            await pt.send(
+                                "\U0001f389 **Promoted from Reserve \u2192 Chop!** "
+                                "A spot opened up. TO will review shortly."
+                            )
+                        except Exception:
+                            pass
+
+        await refresh_team_event_card(interaction.client, self.event_id, interaction.guild)
+
+        uid = interaction.user.id
+        _team_withdraw_count[uid] = _team_withdraw_count.get(uid, 0) + 1
+        if _team_withdraw_count[uid] == 1:
+            try:
+                await interaction.user.send("What, lah! Leaving your team like that?? \U0001f620")
+            except Exception:
+                pass
+
+        await interaction.response.send_message(
+            f"\u2705 Your team has been withdrawn from **{event['name']}**.", ephemeral=True)
+
+
+class TeamChopModal(ui.Modal, title="Register Your Team"):
+    """
+    Captain submits team name, teammate Discord IDs (one per line), and all army lists.
+    For 2v2: 2 lists. For teams_3: 3 lists, etc.
+    We capture: team_name + all members as a formatted block + list_text per member.
+    Since Discord modals max at 5 fields, we use:
+      - Team Name
+      - Teammates (Discord @mentions or usernames, one per line — bot stores for TO review)
+      - Your Army + Detachment
+      - Your List
+      - Teammates' Lists (all other members, labelled)
+    The TO reviews everything in the private thread.
+    """
+    team_name = ui.TextInput(
+        label="Team Name",
+        placeholder="e.g. 'Iron Warriors'",
+        max_length=50,
+        required=True,
+    )
+    teammates = ui.TextInput(
+        label="Teammates (Discord usernames, one per line)",
+        placeholder="e.g.\nBrother_Bertram\nFulk_the_Stern",
+        style=discord.TextStyle.paragraph,
+        max_length=300,
+        required=True,
+    )
+    captain_army = ui.TextInput(
+        label="Your Army & Detachment",
+        placeholder="e.g. Space Marines / Gladius Task Force",
+        max_length=120,
+        required=True,
+    )
+    captain_list = ui.TextInput(
+        label="Your Army List",
+        style=discord.TextStyle.paragraph,
+        placeholder="Paste your full list here…",
+        max_length=3900,
+        required=True,
+    )
+    teammates_lists = ui.TextInput(
+        label="Teammates' Lists (label each: Player: Army / List)",
+        style=discord.TextStyle.paragraph,
+        placeholder="Bertram: Iron Warriors / Warsmith Detachment\n[list]\n---\nFulk: Death Guard / …",
+        max_length=3900,
+        required=True,
+    )
+
+    def __init__(self, event_id: str, as_reserve: bool = False):
+        super().__init__()
+        self.event_id   = event_id
+        self.as_reserve = as_reserve
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        from commands_event import get_or_create_team_chop_thread, refresh_team_event_card
+
+        event = db_get_event(self.event_id)
+        if not event:
+            await interaction.followup.send("\u274c Event not found.", ephemeral=True)
+            return
+
+        t_size    = event.get("team_size", 2)
+        new_state = "reserve" if self.as_reserve else TS.FORMING
+        status_label = "Reserve" if self.as_reserve else "Chop"
+
+        # Parse captain army/det
+        cap_raw = self.captain_army.value.strip()
+        if "/" in cap_raw:
+            cap_army, cap_det = [p.strip() for p in cap_raw.split("/", 1)]
+        else:
+            cap_army, cap_det = cap_raw, "Unknown"
+
+        # Create or update team row
+        existing_team = db_get_team_by_captain(self.event_id, str(interaction.user.id))
+        is_update = existing_team is not None
+
+        if existing_team:
+            team_id = existing_team["team_id"]
+            db_update_team(team_id, {
+                "team_name": self.team_name.value.strip(),
+                "state":     new_state,
+            })
+        else:
+            team_id = db_create_team(
+                self.event_id,
+                self.team_name.value.strip(),
+                str(interaction.user.id),
+                interaction.user.display_name,
+            )
+            db_update_team(team_id, {"state": new_state})
+
+        # Add captain as team member
+        db_add_team_member(
+            team_id, self.event_id,
+            str(interaction.user.id), interaction.user.display_name,
+            role="captain",
+            army=cap_army, detachment=cap_det,
+        )
+        # Store captain's list on their member row
+        db_update_team_member(team_id, str(interaction.user.id), {"list_text": self.captain_list.value})
+
+        # Get or create private thread for this team
+        thread = await get_or_create_team_chop_thread(
+            interaction.client,
+            self.event_id,
+            team_id,
+            str(interaction.user.id),
+            interaction.user.display_name,
+            self.team_name.value.strip(),
+            interaction.guild,
+        )
+
+        # Post review embed in thread
+        if thread:
+            action = "Updated" if is_update else "Submitted"
+            embed = discord.Embed(
+                title=f"\U0001f4cb  Team List {action}  \u2014  {self.team_name.value.strip()}",
+                description=(
+                    f"**Status:** {status_label}\n"
+                    f"**Captain:** {interaction.user.display_name} — {cap_army} · *{cap_det}*\n"
+                    f"**Teammates:**\n```\n{self.teammates.value[:500]}\n```\n"
+                    f"**Captain's List:**\n```\n{self.captain_list.value[:900]}\n```\n"
+                    f"**Teammates' Lists:**\n```\n{self.teammates_lists.value[:900]}\n```"
+                ),
+                color=COLOUR_AMBER,
+            )
+            embed.set_footer(text="TO: use /reg approve / relegate / reject (target the captain)")
+            await thread.send(
+                content=f"\U0001f4ec Team submission from <@{interaction.user.id}> — **{status_label}**",
+                embed=embed,
+            )
+
+        await refresh_team_event_card(interaction.client, self.event_id, interaction.guild)
+
+        await interaction.followup.send(
+            f"\u2705 Team **{self.team_name.value.strip()}** registered for **{event['name']}**!\n"
+            f"Status: **{status_label}**\n"
+            f"The TO will review your submission in the private thread. Watch for a DM when confirmed.",
             ephemeral=True,
         )
 
