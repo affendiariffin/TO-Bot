@@ -1,859 +1,1266 @@
 """
-embeds.py — FND TTS Tournament Bot
+views.py — FND TTS Tournament Bot
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-All discord.Embed builder functions.
+All persistent discord.ui.View and discord.ui.Modal classes,
+plus the game-confirm helper coroutines.
 
-Functions:
-  • vp_bar
-  • build_event_announcement_embed
-  • build_briefing_embed
-  • build_pairings_embed
-  • build_standings_embed
-  • build_team_standings_embed
-  • build_list_review_header
-  • build_player_list_embed
-  • build_judges_on_duty_embed
-  • build_spectator_dashboard_embed
-  • build_event_main_embed
-  • build_schedule_embed
-  • build_missions_embed
+Classes:
+  • EventAnnouncementView
+  • RegistrationApprovalView
+  • PairingActionView
+  • JudgeQueueView
+  • ResultConfirmationView
+  • ListSubmissionModal
+  • ResultModal
+  • RejectionReasonModal
+  • VPAdjustModal
+  • JudgeCloseModal
 
-Imported by: services.py, views.py, commands_*.py
+Helpers:
+  • _confirm_game
+  • _auto_confirm_after_24h
+
+Imported by: services.py, commands_*.py
 """
 import discord
-import math
-from datetime import datetime, timedelta
-from typing import List, Optional
+from discord import ui
+import asyncio
+import psycopg2.extras
+from datetime import datetime, timezone
+from typing import Optional
 from config import (COLOUR_GOLD, COLOUR_CRIMSON, COLOUR_AMBER, COLOUR_SLATE,
-                    SEP, GAME_ROOM_PREFIX,
-                    fe, faction_colour, room_colour, ts, ts_full)
-from state import GS, RndS, JCS, FMT, get_judges_for_guild
-from database import db_get_rounds, db_get_mission
+                    CREW_ROLE_ID, EVENT_NOTICEBOARD_ID,
+                    fe, room_colour)
+from state import GS, RS, JCS, ES, TS, is_to, get_thread_reg, get_judges_for_guild
+from database import *
+from threads import ensure_submissions_thread, event_round_count
+
+# Lazy imports to avoid circular dependencies (services imports from views)
+def _get_refresh_spectator_dashboard():
+    from services import refresh_spectator_dashboard
+    return refresh_spectator_dashboard
+
+def _get_refresh_judges_on_duty():
+    from services import _refresh_judges_on_duty
+    return _refresh_judges_on_duty
+
+def _get_log_immediate():
+    from services import log_immediate
+    return log_immediate
+
+async def refresh_spectator_dashboard(bot, event_id):
+    return await _get_refresh_spectator_dashboard()(bot, event_id)
+
+async def _refresh_judges_on_duty(bot, event_id, guild):
+    return await _get_refresh_judges_on_duty()(bot, event_id, guild)
+
+async def log_immediate(bot, title, description, colour=None):
+    return await _get_log_immediate()(bot, title, description, colour)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# HELPERS
+# VIEWS & BUTTONS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def vp_bar(vp: int, max_vp: int = 120, width: int = 10) -> str:
-    """Unicode VP progress bar.
-    e.g. vp_bar(85) → ▓▓▓▓▓▓▓░░░  85 VP"""
-    if not max_vp:
-        return ""
-    filled = round((vp / max_vp) * width)
-    filled = max(0, min(width, filled))
-    return f"{'▓' * filled}{'░' * (width - filled)}  {vp}"
+# ══════════════════════════════════════════════════════════════════════════════
+# SINGLES REGISTRATION VIEW  —  Chop / Reserve / Withdraw
+# ══════════════════════════════════════════════════════════════════════════════
 
-def _round_slot(round_data: dict | None) -> str:
+class ChopRegistrationView(ui.View):
     """
-    Raw slot string before right-justification.
-    Format: "<vp><result>" e.g. "85W", "42L", "60D".
-    Max 4 chars ("100W"). Returns "-" when game is unconfirmed or missing.
-
-    Expects round_data = {"vp": int | None, "result": "W"|"L"|"D"|None}
-    as produced by db_get_results_by_player.
+    Persistent view on the singles event card.
+    Row 0: Chop ✊ | Reserve 🖐️ | Withdraw 🚪
+    Players click Chop to register interest + submit their list.
+    A private thread is created for list review between the player, bot, and TO.
     """
-    if not round_data or round_data.get("vp") is None:
-        return "-"
-    vp     = round_data["vp"]
-    result = round_data.get("result") or ""
-    suffix = result if result in ("W", "L", "D") else ""
-    return f"{vp}{suffix}"
+    def __init__(self, event_id: str):
+        super().__init__(timeout=None)
+        self.event_id = event_id
 
-def _standings_table(
-    standings: List[dict],
-    done_rounds: int,
-    player_results: dict,
-    include_totals: bool = False,
-) -> str:
+    @ui.button(label="✊  Chop", style=discord.ButtonStyle.success,
+               custom_id="chop_reg_chop", emoji="✊", row=0)
+    async def btn_chop(self, interaction: discord.Interaction, button: ui.Button):
+        event = db_get_event(self.event_id)
+        if not event:
+            await interaction.response.send_message("❌ Event not found.", ephemeral=True)
+            return
+        if event["state"] not in (ES.ANNOUNCED, ES.INTEREST, ES.REGISTRATION):
+            await interaction.response.send_message(
+                "❌ Registration is not currently open.", ephemeral=True)
+            return
+
+        # Check if already registered
+        existing = db_get_registration(self.event_id, str(interaction.user.id))
+        if existing and existing["state"] in (RS.PENDING, RS.APPROVED):
+            await interaction.response.send_message(
+                f"ℹ️ You're already registered as **{'Chop' if existing['state'] == RS.PENDING else 'Confirmed'}**.\n"
+                f"To update your list, use the **Reserve** button to resubmit, or contact the TO.",
+                ephemeral=True)
+            return
+        if existing and existing["state"] == RS.REJECTED:
+            await interaction.response.send_message(
+                "❌ Your registration was rejected. Contact the TO.", ephemeral=True)
+            return
+
+        # Check if the Chop slots are full (Confirmed + Chop >= max_players)
+        confirmed_count = len(db_get_registrations(self.event_id, RS.APPROVED))
+        chop_count      = len(db_get_registrations(self.event_id, RS.PENDING))
+        if confirmed_count + chop_count >= event["max_players"]:
+            await interaction.response.send_message(
+                f"ℹ️ The Chop slots are full ({confirmed_count + chop_count}/{event['max_players']}).\n"
+                f"Click **Reserve 🖐️** to join the waitlist instead.",
+                ephemeral=True)
+            return
+
+        await interaction.response.send_modal(
+            ChopListSubmissionModal(self.event_id, as_reserve=False)
+        )
+
+    @ui.button(label="🖐️  Reserve", style=discord.ButtonStyle.primary,
+               custom_id="chop_reg_reserve", emoji="🖐️", row=0)
+    async def btn_reserve(self, interaction: discord.Interaction, button: ui.Button):
+        event = db_get_event(self.event_id)
+        if not event:
+            await interaction.response.send_message("❌ Event not found.", ephemeral=True)
+            return
+        if event["state"] not in (ES.ANNOUNCED, ES.INTEREST, ES.REGISTRATION):
+            await interaction.response.send_message(
+                "❌ Registration is not currently open.", ephemeral=True)
+            return
+
+        existing = db_get_registration(self.event_id, str(interaction.user.id))
+        if existing and existing["state"] in (RS.PENDING, RS.APPROVED):
+            await interaction.response.send_message(
+                f"ℹ️ You're already registered as **{'Chop' if existing['state'] == RS.PENDING else 'Confirmed'}**. "
+                "Contact the TO if you need to update your list.",
+                ephemeral=True)
+            return
+        if existing and existing["state"] == RS.REJECTED:
+            await interaction.response.send_message(
+                "❌ Your registration was rejected. Contact the TO.", ephemeral=True)
+            return
+        # INTERESTED (Reserve) falls through — can re-open modal to update their list
+
+        await interaction.response.send_modal(
+            ChopListSubmissionModal(self.event_id, as_reserve=True)
+        )
+
+    @ui.button(label="🚪  Withdraw", style=discord.ButtonStyle.secondary,
+               custom_id="chop_reg_withdraw", emoji="🚪", row=0)
+    async def btn_withdraw(self, interaction: discord.Interaction, button: ui.Button):
+        reg = db_get_registration(self.event_id, str(interaction.user.id))
+        if not reg or reg["state"] in (RS.DROPPED, RS.REJECTED):
+            await interaction.response.send_message(
+                "❌ You're not currently registered for this event.", ephemeral=True)
+            return
+
+        from commands_event import refresh_event_card
+        event = db_get_event(self.event_id)
+        was_confirmed = reg["state"] == RS.APPROVED
+        was_chop      = reg["state"] == RS.PENDING
+
+        db_update_registration(self.event_id, str(interaction.user.id), {
+            "state":      RS.DROPPED,
+            "dropped_at": datetime.utcnow(),
+        })
+        if was_confirmed:
+            db_update_standing(self.event_id, str(interaction.user.id), {"active": False})
+
+        # Close private thread
+        tid = reg.get("chop_thread_id")
+        if tid:
+            t = interaction.guild.get_thread(int(tid))
+            if t:
+                try:
+                    await t.send("👋 Player has withdrawn. This thread is now closed.")
+                    await t.edit(archived=True, locked=True)
+                except Exception:
+                    pass
+
+        # Promote oldest Reserve if Chop/Confirmed withdrew
+        if was_chop or was_confirmed:
+            all_regs = db_get_registrations(self.event_id)
+            reserves = sorted(
+                [r for r in all_regs if r["state"] == RS.INTERESTED
+                 and r["player_id"] != str(interaction.user.id)],
+                key=lambda r: r.get("submitted_at") or datetime.min,
+            )
+            if reserves:
+                promoted = reserves[0]
+                db_update_registration(self.event_id, promoted["player_id"], {"state": RS.PENDING})
+                try:
+                    pu = await interaction.client.fetch_user(int(promoted["player_id"]))
+                    await pu.send(
+                        f"🎉 **Promoted from Reserve to Chop for {event['name']}!**\n"
+                        f"Check your private thread — the TO will review your list shortly."
+                    )
+                except Exception:
+                    pass
+                p_tid = promoted.get("chop_thread_id")
+                if p_tid:
+                    pt = interaction.guild.get_thread(int(p_tid))
+                    if pt:
+                        try:
+                            await pt.send(
+                                f"🎉 **You've been promoted from Reserve → Chop!**\n"
+                                f"A Chop spot opened up. The TO will review and confirm shortly."
+                            )
+                        except Exception:
+                            pass
+
+        await refresh_event_card(interaction.client, self.event_id, interaction.guild)
+
+        # Withdrawal flavour text (adapted from LFG bot)
+        uid = interaction.user.id
+        _withdraw_count[uid] = _withdraw_count.get(uid, 0) + 1
+        if _withdraw_count[uid] == 1:
+            try:
+                await interaction.user.send("What, lah! Don't leave a bro hanging la bro. 😤")
+            except Exception:
+                pass
+
+        await interaction.response.send_message("✅ You've withdrawn from this event.", ephemeral=True)
+
+
+# Simple in-memory withdrawal counter (mirrors LFG bot pattern)
+_withdraw_count: dict[int, int] = {}
+
+
+class ChopListSubmissionModal(ui.Modal, title="Submit Your Army List"):
     """
-    Monospace standings table in a code block.
-    Renders exactly done_rounds slot columns — never more.
+    Modal opened when a player clicks Chop or Reserve.
+    Captures army name, detachment, and list text.
+    On submit: creates/updates registration and creates private thread.
     """
-    if not standings:
-        return "*No results yet.*"
+    army       = ui.TextInput(label="Army / Faction",      placeholder="e.g. Space Marines",       max_length=80)
+    detachment = ui.TextInput(label="Detachment",          placeholder="e.g. Gladius Task Force",  max_length=80)
+    list_text  = ui.TextInput(
+        label="Army List",
+        style=discord.TextStyle.paragraph,
+        placeholder="Paste your full list here (from New Recruit / BattleScribe / Wahapedia)…",
+        max_length=3900,
+    )
 
-    # Pre-event or between Round 1 — just show roster order
-    if done_rounds == 0:
-        return "```\n" + "\n".join(
-            f"{(str(i) + '.').rjust(3)} {s['player_username'][:18]}"
-            for i, s in enumerate(standings, 1)
-        ) + "\n```"
+    def __init__(self, event_id: str, as_reserve: bool = False):
+        super().__init__()
+        self.event_id   = event_id
+        self.as_reserve = as_reserve
 
-    SLOT_W   = 4   # "100W" is the widest possible value
-    max_name = max((len(s["player_username"]) for s in standings), default=8)
-    name_w   = min(max_name, 18)
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
 
-    lines = []
-    for i, s in enumerate(standings, 1):
-        pid  = s["player_id"]
-        pos  = f"{i}.".rjust(3)
-        name = s["player_username"][:name_w].ljust(name_w)
+        event = db_get_event(self.event_id)
+        if not event:
+            await interaction.followup.send("❌ Event not found.", ephemeral=True)
+            return
 
-        pr    = player_results.get(pid, {})
-        slots = [
-            _round_slot(pr.get(rn)).rjust(SLOT_W)
-            for rn in range(1, done_rounds + 1)
-        ]
-        score_str = " / ".join(slots)
+        new_state = RS.INTERESTED if self.as_reserve else RS.PENDING
 
-        if include_totals:
-            vp_tot = s.get("vp_total", 0)
-            vdiff  = s.get("vp_diff", 0)
-            totals = f"  {vp_tot:>3}VP ({vdiff:>+4})"
+        # Check if re-submitting before upsert (determines "Updated" vs "Submitted" label)
+        existing = db_get_registration(self.event_id, str(interaction.user.id))
+        is_update = existing is not None
+
+        db_upsert_registration(
+            self.event_id, str(interaction.user.id),
+            interaction.user.display_name, new_state,
+            army=self.army.value.strip(),
+            det=self.detachment.value.strip(),
+            list_text=self.list_text.value,
+        )
+
+        # Get or create private thread for this player
+        from commands_event import get_or_create_chop_thread, refresh_event_card
+        thread = await get_or_create_chop_thread(
+            interaction.client,
+            self.event_id,
+            str(interaction.user.id),
+            interaction.user.display_name,
+            interaction.guild,
+        )
+
+        status_label = "Reserve" if self.as_reserve else "Chop"
+
+        if thread:
+            embed = discord.Embed(
+                title=f"📋  List {'Updated' if is_update else 'Submitted'}  —  {interaction.user.display_name}",
+                description=(
+                    f"**Status:** {status_label}\n"
+                    f"⚔️ **{self.army.value.strip()}** · *{self.detachment.value.strip()}*\n\n"
+                    f"```\n{self.list_text.value[:1800]}\n```"
+                    + ("\n*[truncated]*" if len(self.list_text.value) > 1800 else "")
+                ),
+                color=COLOUR_AMBER,
+            )
+            embed.set_footer(text="TO: use /reg approve / relegate / reject")
+            await thread.send(
+                content=f"📬 New list submission from <@{interaction.user.id}> — **{status_label}**",
+                embed=embed,
+            )
+
+        await refresh_event_card(interaction.client, self.event_id, interaction.guild)
+
+        await interaction.followup.send(
+            f"✅ List submitted for **{event['name']}**!\n"
+            f"Status: **{status_label}**\n"
+            f"Army: **{self.army.value.strip()}** · *{self.detachment.value.strip()}*\n"
+            f"The TO will review your list in your private thread. Watch for a DM when confirmed.",
+            ephemeral=True,
+        )
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TEAM EVENT VIEWS  —  2v2, Teams 3s/5s/8s
+# ══════════════════════════════════════════════════════════════════════════════
+
+_team_withdraw_count: dict[int, int] = {}
+
+
+class TeamChopRegistrationView(ui.View):
+    """
+    Persistent view on the team event card.
+    Captain clicks Chop to register their team.
+    """
+    def __init__(self, event_id: str):
+        super().__init__(timeout=None)
+        self.event_id = event_id
+
+    @ui.button(label="\u270a  Captain Chop", style=discord.ButtonStyle.success,
+               custom_id="team_reg_chop", row=0)
+    async def btn_chop(self, interaction: discord.Interaction, button: ui.Button):
+        from commands_event import refresh_team_event_card
+        event = db_get_event(self.event_id)
+        if not event:
+            await interaction.response.send_message("\u274c Event not found.", ephemeral=True)
+            return
+        if event["state"] not in (ES.ANNOUNCED, ES.INTEREST, ES.REGISTRATION):
+            await interaction.response.send_message(
+                "\u274c Registration is not currently open.", ephemeral=True)
+            return
+
+        # Only one team per captain per event
+        existing = db_get_team_by_captain(self.event_id, str(interaction.user.id))
+        if existing and existing["state"] not in (TS.DROPPED,):
+            state_label = {"forming": "Chop", "ready": "Confirmed", "reserve": "Reserve"}.get(
+                existing["state"], existing["state"])
+            await interaction.response.send_message(
+                f"\u2139\ufe0f You already have a team registered as **{state_label}** for this event.\n"
+                f"Use your private thread to update your lists, or click **Withdraw** to drop out.",
+                ephemeral=True)
+            return
+
+        # Check if Chop slots are full (confirmed + chop >= max_teams)
+        t_size    = event.get("team_size", 2)
+        max_teams = event.get("max_players", 0) // t_size if t_size else 0
+        all_teams = db_get_teams(self.event_id)
+        active_count = sum(1 for t in all_teams if t["state"] in (TS.FORMING, TS.READY))
+        if active_count >= max_teams:
+            await interaction.response.send_message(
+                f"\u2139\ufe0f Chop slots are full ({active_count}/{max_teams} teams).\n"
+                f"Click **Reserve \U0001f91a** to join the waitlist.",
+                ephemeral=True)
+            return
+
+        await interaction.response.send_modal(TeamChopModal(self.event_id, as_reserve=False))
+
+    @ui.button(label="\U0001f91a  Captain Reserve", style=discord.ButtonStyle.primary,
+               custom_id="team_reg_reserve", row=0)
+    async def btn_reserve(self, interaction: discord.Interaction, button: ui.Button):
+        event = db_get_event(self.event_id)
+        if not event:
+            await interaction.response.send_message("\u274c Event not found.", ephemeral=True)
+            return
+        if event["state"] not in (ES.ANNOUNCED, ES.INTEREST, ES.REGISTRATION):
+            await interaction.response.send_message(
+                "\u274c Registration is not currently open.", ephemeral=True)
+            return
+
+        existing = db_get_team_by_captain(self.event_id, str(interaction.user.id))
+        if existing and existing["state"] in (TS.FORMING, TS.READY):
+            state_label = "Chop" if existing["state"] == TS.FORMING else "Confirmed"
+            await interaction.response.send_message(
+                f"\u2139\ufe0f Your team is already registered as **{state_label}**. "
+                f"Contact the TO if you need to update your lists.",
+                ephemeral=True)
+            return
+        # "reserve" state or dropped can re-open the modal
+        await interaction.response.send_modal(TeamChopModal(self.event_id, as_reserve=True))
+
+    @ui.button(label="\U0001f6aa  Withdraw", style=discord.ButtonStyle.secondary,
+               custom_id="team_reg_withdraw", row=0)
+    async def btn_withdraw(self, interaction: discord.Interaction, button: ui.Button):
+        from commands_event import refresh_team_event_card
+        event = db_get_event(self.event_id)
+        team  = db_get_team_by_captain(self.event_id, str(interaction.user.id))
+        if not team or team["state"] == TS.DROPPED:
+            await interaction.response.send_message(
+                "\u274c You don't have an active team registration for this event.", ephemeral=True)
+            return
+
+        was_chop_or_confirmed = team["state"] in (TS.FORMING, TS.READY)
+        db_update_team(team["team_id"], {"state": TS.DROPPED})
+
+        # Close captain thread
+        tid = team.get("captains_thread_id")
+        if tid:
+            t = interaction.guild.get_thread(int(tid))
+            if t:
+                try:
+                    await t.send("\U0001f44b Team has withdrawn. This thread is now closed.")
+                    await t.edit(archived=True, locked=True)
+                except Exception:
+                    pass
+
+        # Promote oldest reserve team
+        if was_chop_or_confirmed:
+            all_teams    = db_get_teams(self.event_id)
+            reserve_list = sorted(
+                [t for t in all_teams if t["state"] == "reserve" and t["team_id"] != team["team_id"]],
+                key=lambda t: t.get("created_at") or datetime.min,
+            )
+            if reserve_list:
+                promoted = reserve_list[0]
+                db_update_team(promoted["team_id"], {"state": TS.FORMING})
+                try:
+                    cap = await interaction.client.fetch_user(int(promoted["captain_id"]))
+                    await cap.send(
+                        f"\U0001f389 **Team '{promoted['team_name']}' promoted from Reserve to Chop "
+                        f"for {event['name']}!**\nA spot opened up. The TO will review your lists shortly."
+                    )
+                except Exception:
+                    pass
+                ptid = promoted.get("captains_thread_id")
+                if ptid:
+                    pt = interaction.guild.get_thread(int(ptid))
+                    if pt:
+                        try:
+                            await pt.send(
+                                "\U0001f389 **Promoted from Reserve \u2192 Chop!** "
+                                "A spot opened up. TO will review shortly."
+                            )
+                        except Exception:
+                            pass
+
+        await refresh_team_event_card(interaction.client, self.event_id, interaction.guild)
+
+        uid = interaction.user.id
+        _team_withdraw_count[uid] = _team_withdraw_count.get(uid, 0) + 1
+        if _team_withdraw_count[uid] == 1:
+            try:
+                await interaction.user.send("What, lah! Leaving your team like that?? \U0001f620")
+            except Exception:
+                pass
+
+        await interaction.response.send_message(
+            f"\u2705 Your team has been withdrawn from **{event['name']}**.", ephemeral=True)
+
+
+class TeamChopModal(ui.Modal, title="Register Your Team"):
+    """
+    Captain submits team name, teammate Discord IDs (one per line), and all army lists.
+    For 2v2: 2 lists. For teams_3: 3 lists, etc.
+    We capture: team_name + all members as a formatted block + list_text per member.
+    Since Discord modals max at 5 fields, we use:
+      - Team Name
+      - Teammates (Discord @mentions or usernames, one per line — bot stores for TO review)
+      - Your Army + Detachment
+      - Your List
+      - Teammates' Lists (all other members, labelled)
+    The TO reviews everything in the private thread.
+    """
+    team_name = ui.TextInput(
+        label="Team Name",
+        placeholder="e.g. 'Iron Warriors'",
+        max_length=50,
+        required=True,
+    )
+    teammates = ui.TextInput(
+        label="Teammates (Discord usernames, one per line)",
+        placeholder="e.g.\nBrother_Bertram\nFulk_the_Stern",
+        style=discord.TextStyle.paragraph,
+        max_length=300,
+        required=True,
+    )
+    captain_army = ui.TextInput(
+        label="Your Army & Detachment",
+        placeholder="e.g. Space Marines / Gladius Task Force",
+        max_length=120,
+        required=True,
+    )
+    captain_list = ui.TextInput(
+        label="Your Army List",
+        style=discord.TextStyle.paragraph,
+        placeholder="Paste your full list here…",
+        max_length=3900,
+        required=True,
+    )
+    teammates_lists = ui.TextInput(
+        label="Teammates' Lists (label each: Player: Army / List)",
+        style=discord.TextStyle.paragraph,
+        placeholder="Bertram: Iron Warriors / Warsmith Detachment\n[list]\n---\nFulk: Death Guard / …",
+        max_length=3900,
+        required=True,
+    )
+
+    def __init__(self, event_id: str, as_reserve: bool = False):
+        super().__init__()
+        self.event_id   = event_id
+        self.as_reserve = as_reserve
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        from commands_event import get_or_create_team_chop_thread, refresh_team_event_card
+
+        event = db_get_event(self.event_id)
+        if not event:
+            await interaction.followup.send("\u274c Event not found.", ephemeral=True)
+            return
+
+        t_size    = event.get("team_size", 2)
+        new_state = "reserve" if self.as_reserve else TS.FORMING
+        status_label = "Reserve" if self.as_reserve else "Chop"
+
+        # Parse captain army/det
+        cap_raw = self.captain_army.value.strip()
+        if "/" in cap_raw:
+            cap_army, cap_det = [p.strip() for p in cap_raw.split("/", 1)]
         else:
-            totals = ""
+            cap_army, cap_det = cap_raw, "Unknown"
 
-        lines.append(f"{pos} {name}  {score_str}{totals}")
+        # Create or update team row
+        existing_team = db_get_team_by_captain(self.event_id, str(interaction.user.id))
+        is_update = existing_team is not None
 
-    return "```\n" + "\n".join(lines) + "\n```"
-
-# ══════════════════════════════════════════════════════════════════════════════
-# EMBED BUILDERS  —  TV-bot design language
-# ══════════════════════════════════════════════════════════════════════════════
-
-def build_singles_event_card(
-    event: dict,
-    regs: list,
-    deadline_passed: bool = False,
-) -> discord.Embed:
-    """
-    The main registration card for a singles event (posted at creation, updated live).
-
-    Three registration sections:
-      ✅ Confirmed  (RS.APPROVED)
-      ✊ Chop       (RS.PENDING)   — hidden when deadline_passed=True
-      🖐️ Reserve    (RS.INTERESTED) — hidden when deadline_passed=True
-
-    Also shows: schedule (KL time), rules cutoff, registration deadline.
-    """
-    from state import RS as _RS
-
-    sd    = event["start_date"]
-    multi = event["start_date"] != event["end_date"]
-    dstr  = (
-        f"{sd.strftime('%a %d %b')} — {event['end_date'].strftime('%a %d %b %Y')}"
-        if multi else sd.strftime("%A %d %B %Y")
-    )
-    round_count = event.get("round_count", 3)
-    day_label   = "1 day" if round_count == 3 else "2 days"
-
-    confirmed_regs = [r for r in regs if r["state"] == _RS.APPROVED]
-    chop_regs      = [r for r in regs if r["state"] == _RS.PENDING]
-    reserve_regs   = [r for r in regs if r["state"] == _RS.INTERESTED]
-
-    def _roster(lst, icon=""):
-        if not lst:
-            return "*None yet*"
-        return "\n".join(f"{icon} {fe(r['army'])} **{r['player_username']}**" for r in lst)
-
-    embed = discord.Embed(
-        title=f"🏆  {event['name']}",
-        description=(
-            f"**Warhammer 40,000  ·  Tabletop Simulator  ·  Singles**\n"
-            f"{event['points_limit']} pts  ·  **{round_count} rounds**  ·  {day_label}\n"
-            f"{SEP}"
-        ),
-        color=COLOUR_GOLD,
-    )
-    embed.add_field(name="📅  Date",        value=dstr,                    inline=True)
-    embed.add_field(name="👥  Max Players", value=str(event["max_players"]), inline=True)
-    embed.add_field(name="🎲  Rounds",      value=f"{round_count} · Swiss", inline=True)
-
-    # Schedule — use pre-built slots injected at creation time if available
-    sched_slots: list = event.get("_schedule_slots") or []
-    if sched_slots:
-        sched_lines = []
-        for s in sched_slots:
-            ts_s = f"<t:{int(s['start_dt'].timestamp())}:t>"
-            ts_e = f"<t:{int(s['end_dt'].timestamp())}:t>"
-            sched_lines.append(f"{s['label']}  {ts_s}–{ts_e}")
-        embed.add_field(name="🕗  Schedule (KL time)", value="\n".join(sched_lines), inline=False)
-    else:
-        embed.add_field(name="🕗  Start Time", value=f"**8:30am KL time** on {dstr}", inline=False)
-
-    # Key dates (rules cutoff + reg deadline)
-    from datetime import datetime as _dtm, date as _date
-    rules_cutoff = event.get("_rules_cutoff") or event.get("rules_cutoff")
-    reg_deadline = event.get("_reg_deadline") or event.get("reg_deadline")
-    date_lines: list[str] = []
-    for label, val, fmt in [
-        ("📋  Rules cutoff",        rules_cutoff, "Submitted lists must comply with rules as of this date"),
-        ("⏰  Registration closes", reg_deadline,  ""),
-    ]:
-        if not val:
-            continue
-        if isinstance(val, str):
-            try:
-                val = _dtm.strptime(val, "%Y-%m-%d").date()
-            except Exception:
-                continue
-        date_lines.append(f"{label}: **{val.strftime('%a %d %b %Y')}**")
-    if date_lines:
-        embed.add_field(name="📅  Key Dates", value="\n".join(date_lines), inline=False)
-
-    # Registration sections
-    if not deadline_passed:
-        embed.add_field(
-            name=f"✅  Confirmed  ({len(confirmed_regs)}/{event['max_players']})",
-            value=_roster(confirmed_regs, "✅"),
-            inline=False,
-        )
-        embed.add_field(
-            name=f"✊  Chop  ({len(chop_regs)})",
-            value=_roster(chop_regs, "✊"),
-            inline=True,
-        )
-        embed.add_field(
-            name=f"🖐️  Reserve  ({len(reserve_regs)})",
-            value=_roster(reserve_regs, "🖐️"),
-            inline=True,
-        )
-        embed.set_footer(
-            text=(
-                "Click Chop ✊ to register and submit your list  ·  "
-                "TO reviews and confirms your spot  ·  "
-                "Lists are private until registration closes"
+        if existing_team:
+            team_id = existing_team["team_id"]
+            db_update_team(team_id, {
+                "team_name": self.team_name.value.strip(),
+                "state":     new_state,
+            })
+        else:
+            team_id = db_create_team(
+                self.event_id,
+                self.team_name.value.strip(),
+                str(interaction.user.id),
+                interaction.user.display_name,
             )
+            db_update_team(team_id, {"state": new_state})
+
+        # Add captain as team member
+        db_add_team_member(
+            team_id, self.event_id,
+            str(interaction.user.id), interaction.user.display_name,
+            role="captain",
+            army=cap_army, detachment=cap_det,
         )
-    else:
-        embed.add_field(
-            name=f"✅  Confirmed Players  ({len(confirmed_regs)}/{event['max_players']})",
-            value=_roster(confirmed_regs, "✅"),
-            inline=False,
+        # Store captain's list on their member row
+        db_update_team_member(team_id, str(interaction.user.id), {"list_text": self.captain_list.value})
+
+        # Get or create private thread for this team
+        thread = await get_or_create_team_chop_thread(
+            interaction.client,
+            self.event_id,
+            team_id,
+            str(interaction.user.id),
+            interaction.user.display_name,
+            self.team_name.value.strip(),
+            interaction.guild,
         )
-        embed.set_footer(text="Registration closed · Army lists published in the thread above")
 
-    return embed
-
-
-def build_team_event_card(
-    event: dict,
-    teams: list,
-    deadline_passed: bool = False,
-) -> discord.Embed:
-    """
-    Registration card for 2v2 and team-format events.
-
-    Shows teams in three sections:
-      Confirmed (state==TS.READY)
-      Chop      (state==TS.FORMING)
-      Reserve   (state=="reserve")
-
-    deadline_passed=True: Confirmed section only, no buttons.
-    Each team entry shows the captain name and (once submitted) team name.
-    """
-    from state import TS as _TS
-
-    sd    = event["start_date"]
-    multi = event["start_date"] != event["end_date"]
-    dstr  = (
-        f"{sd.strftime('%a %d %b')} — {event['end_date'].strftime('%a %d %b %Y')}"
-        if multi else sd.strftime("%A %d %B %Y")
-    )
-
-    t_size      = event.get("team_size", 2)
-    round_count = event.get("round_count", 3)
-    day_label   = "1 day" if round_count <= 3 else "2 days"
-    max_teams   = event.get("max_players", 0) // t_size if t_size else "?"
-    fmt_label   = {
-        "2v2":     "2v2",
-        "teams_3": "Teams 3s",
-        "teams_5": "Teams 5s",
-        "teams_8": "Teams 8s",
-    }.get(event.get("format", ""), "Teams")
-
-    confirmed = [t for t in teams if t["state"] == _TS.READY]
-    chop      = [t for t in teams if t["state"] == _TS.FORMING]
-    reserve   = [t for t in teams if t["state"] == "reserve"]
-
-    def _team_line(team, icon=""):
-        return f"{icon} **{team['team_name']}** (captain: {team['captain_username']})"
-
-    embed = discord.Embed(
-        title=f"🏆  {event['name']}",
-        description=(
-            f"**Warhammer 40,000  ·  Tabletop Simulator  ·  {fmt_label}**\n"
-            f"{event['points_limit']} pts  ·  **{round_count} round{'s' if round_count > 1 else ''}**  ·  {day_label}\n"
-            f"{SEP}"
-        ),
-        color=COLOUR_GOLD,
-    )
-    embed.add_field(name="📅  Date",         value=dstr,                       inline=True)
-    embed.add_field(name="👥  Teams",         value=f"{max_teams} teams",       inline=True)
-    embed.add_field(name="🎲  Rounds",        value=f"{round_count} · Swiss",   inline=True)
-    embed.add_field(name="🧑‍🤝‍🧑  Team Size",  value=f"{t_size} players/team",   inline=True)
-
-    # Schedule — labels padded to align times column; times bold
-    # Emojis render ~2 chars wide, so visual_len counts each emoji cluster as +2
-    sched_slots: list = event.get("_schedule_slots") or []
-    if sched_slots:
-        import re as _re
-        def _visual_len(lbl: str) -> int:
-            plain = _re.sub(r"[^\x00-\x7F]", "", lbl).strip()
-            emoji_clusters = len(_re.findall(r"[^\x00-\x7F]+", lbl))
-            return len(plain) + emoji_clusters * 2
-        max_vlen = max(_visual_len(s["label"]) for s in sched_slots)
-        sched_lines = []
-        for s in sched_slots:
-            pad  = "\u2002" * (max_vlen - _visual_len(s["label"]))
-            ts_s = f"<t:{int(s['start_dt'].timestamp())}:t>"
-            sched_lines.append(f"{s['label']}{pad}  **{ts_s}**")
-        embed.add_field(name="🕗  Schedule (KL time)", value="\n".join(sched_lines), inline=False)
-    else:
-        embed.add_field(name="🕗  Start Time", value=f"**8:30am KL time** on {dstr}", inline=False)
-
-    # Key dates
-    from datetime import datetime as _dtm
-    rules_cutoff = event.get("_rules_cutoff") or event.get("rules_cutoff")
-    reg_deadline = event.get("_reg_deadline") or event.get("reg_deadline")
-    date_lines: list[str] = []
-    for label, val in [("📋  Rules cutoff", rules_cutoff), ("⏰  Registration closes", reg_deadline)]:
-        if not val:
-            continue
-        if isinstance(val, str):
-            try:
-                val = _dtm.strptime(val, "%Y-%m-%d").date()
-            except Exception:
-                continue
-        date_lines.append(f"{label}: **{val.strftime('%a %d %b %Y')}**")
-    if date_lines:
-        embed.add_field(name="📅  Key Dates", value="\n".join(date_lines), inline=False)
-
-    # Registration sections
-    slots_full = isinstance(max_teams, int) and (len(confirmed) + len(chop)) >= max_teams
-    if not deadline_passed:
-        embed.add_field(
-            name=f"✅  Confirmed  ({len(confirmed)}/{max_teams})",
-            value="\n".join(_team_line(t, "✅") for t in confirmed) or "*None yet*",
-            inline=False,
-        )
-        embed.add_field(
-            name=f"✊  Chop  ({len(chop)})",
-            value="\n".join(_team_line(t, "✊") for t in chop) or ("*Full*" if slots_full else "*None yet*"),
-            inline=True,
-        )
-        embed.add_field(
-            name=f"🖐️  Reserve  ({len(reserve)})",
-            value="\n".join(_team_line(t, "🖐️") for t in reserve) or "*None yet*",
-            inline=True,
-        )
-        embed.set_footer(
-            text=(
-                "Captain: click Chop ✊ to register your team and submit all lists  ·  "
-                "TO reviews and confirms your spot  ·  Lists are private until registration closes"
+        # Post review embed in thread
+        if thread:
+            action = "Updated" if is_update else "Submitted"
+            embed = discord.Embed(
+                title=f"\U0001f4cb  Team List {action}  \u2014  {self.team_name.value.strip()}",
+                description=(
+                    f"**Status:** {status_label}\n"
+                    f"**Captain:** {interaction.user.display_name} — {cap_army} · *{cap_det}*\n"
+                    f"**Teammates:**\n```\n{self.teammates.value[:500]}\n```\n"
+                    f"**Captain's List:**\n```\n{self.captain_list.value[:900]}\n```\n"
+                    f"**Teammates' Lists:**\n```\n{self.teammates_lists.value[:900]}\n```"
+                ),
+                color=COLOUR_AMBER,
             )
+            embed.set_footer(text="TO: use /reg approve / relegate / reject (target the captain)")
+            await thread.send(
+                content=f"\U0001f4ec Team submission from <@{interaction.user.id}> — **{status_label}**",
+                embed=embed,
+            )
+
+        await refresh_team_event_card(interaction.client, self.event_id, interaction.guild)
+
+        await interaction.followup.send(
+            f"\u2705 Team **{self.team_name.value.strip()}** registered for **{event['name']}**!\n"
+            f"Status: **{status_label}**\n"
+            f"The TO will review your submission in the private thread. Watch for a DM when confirmed.",
+            ephemeral=True,
         )
-    else:
-        embed.add_field(
-            name=f"✅  Confirmed Teams  ({len(confirmed)}/{max_teams})",
-            value="\n".join(_team_line(t, "✅") for t in confirmed) or "*None*",
-            inline=False,
+
+
+class EventAnnouncementView(ui.View):
+    """Pinned on the event announcement card."""
+    def __init__(self, event_id: str):
+        super().__init__(timeout=None)
+        self.event_id = event_id
+
+    @ui.button(label="✋  Register Interest", style=discord.ButtonStyle.success,
+               custom_id="btn_interest")
+    async def btn_interest(self, interaction: discord.Interaction, button: ui.Button):
+        event = db_get_event(self.event_id)
+        if not event or event["state"] not in (ES.ANNOUNCED, ES.INTEREST):
+            await interaction.response.send_message("❌ Interest registration is not open.", ephemeral=True)
+            return
+        existing = db_get_registration(self.event_id, str(interaction.user.id))
+        if existing:
+            await interaction.response.send_message(
+                f"ℹ️ You're already registered as **{existing['state']}**.", ephemeral=True)
+            return
+        db_upsert_registration(self.event_id, str(interaction.user.id),
+                                interaction.user.display_name, RS.INTERESTED)
+        db_queue_log(f"{interaction.user.display_name} registered interest", self.event_id)
+        await interaction.response.send_message(
+            "✅ Interest noted! You'll be pinged when registration opens.", ephemeral=True)
+
+    @ui.button(label="📋  View Event Details", style=discord.ButtonStyle.secondary,
+               custom_id="btn_event_details")
+    async def btn_details(self, interaction: discord.Interaction, button: ui.Button):
+        event = db_get_event(self.event_id)
+        m = db_get_mission(event["mission_code"])
+        embed = discord.Embed(
+            title=f"📋  {event['name']}  —  Details",
+            color=COLOUR_GOLD,
         )
-        embed.set_footer(text="Registration closed · Army lists published in the thread above")
+        embed.add_field(name="Mission",    value=f"{m.get('name','—')} — *{m.get('deployment','—')}*", inline=False)
+        embed.add_field(name="Layouts",    value=", ".join(m.get("layouts", [])),                       inline=True)
+        embed.add_field(name="Points",     value=f"{event['points_limit']} pts",                         inline=True)
+        embed.add_field(name="Max Players",value=str(event["max_players"]),                              inline=True)
+        embed.add_field(name="Rounds",     value=f"{event_round_count(event)} total · {event['rounds_per_day']}/day", inline=True)
+        if event.get("terrain_layout"):
+            embed.add_field(name="Terrain Layout", value=event["terrain_layout"], inline=False)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    return embed
+
+class RegistrationApprovalView(ui.View):
+    """Appears on TO notification when a player submits their list."""
+    def __init__(self, event_id: str, player_id: str):
+        super().__init__(timeout=None)
+        self.event_id  = event_id
+        self.player_id = player_id
+
+    @ui.button(label="✅  Approve", style=discord.ButtonStyle.success)
+    async def btn_approve(self, interaction: discord.Interaction, button: ui.Button):
+        if not is_to(interaction):
+            await interaction.response.send_message("❌ TO only.", ephemeral=True); return
+        reg = db_get_registration(self.event_id, self.player_id)
+        if not reg or reg["state"] == RS.APPROVED:
+            await interaction.response.send_message("ℹ️ Already approved or not found.", ephemeral=True); return
+        event = db_get_event(self.event_id)
+        db_update_registration(self.event_id, self.player_id,
+                                {"state": RS.APPROVED, "approved_at": datetime.utcnow()})
+        db_upsert_standing(self.event_id, self.player_id, reg["player_username"],
+                            reg["army"], reg["detachment"])
+        # Add player to all existing event threads
+        await add_player_to_event_threads(interaction.client, self.event_id, interaction.guild, self.player_id)
+        try:
+            user = await interaction.client.fetch_user(int(self.player_id))
+            await user.send(
+                f"✅ **You're in! Registration approved for {event['name']}**\n"
+                f"{fe(reg['army'])} {reg['army']} · *{reg['detachment']}*\n"
+                f"Watch #event-noticeboard for pairings. For the Emperor! ⚔️"
+            )
+        except: pass
+        db_queue_log(f"Registration approved: {reg['player_username']} ({reg['army']})", self.event_id)
+        await interaction.response.edit_message(
+            content=f"✅ **{reg['player_username']}** approved.",
+            embed=interaction.message.embeds[0] if interaction.message.embeds else None,
+            view=None,
+        )
+
+    @ui.button(label="❌  Reject", style=discord.ButtonStyle.danger)
+    async def btn_reject(self, interaction: discord.Interaction, button: ui.Button):
+        if not is_to(interaction):
+            await interaction.response.send_message("❌ TO only.", ephemeral=True); return
+        await interaction.response.send_modal(RejectionReasonModal(self.event_id, self.player_id,
+                                                                    interaction.message))
 
 
-def build_event_main_embed(event: dict, regs: list) -> discord.Embed:
+class PairingActionView(ui.View):
     """
-    Card 1 — Event Main Details.
-    Pinned by admin in #event-noticeboard.
-    Shows core event info + current player roster.
+    Buttons attached to each pairing row in the pairings message.
+    One view per game — Submit Result + Judge Call.
+    Uses persistent custom_ids encoding the game_id.
     """
-    m           = db_get_mission(event["mission_code"])
-    sd, ed      = event["start_date"], event["end_date"]
-    multi       = sd != ed
-    dstr        = (f"{sd.strftime('%a %d %b')} — {ed.strftime('%a %d %b %Y')}"
-                   if multi else sd.strftime("%A %d %B %Y"))
-    total_rounds = event.get("round_count", 3)
-    fmt_label   = {
-        "singles": "Singles", "2v2": "2v2",
-        "teams_3": "Teams 3s", "teams_5": "Teams 5s", "teams_8": "Teams 8s",
-    }.get(event.get("format", "singles"), "Singles")
+    def __init__(self, game_id: str, event_id: str, room_number: int):
+        super().__init__(timeout=None)
+        self.game_id     = game_id
+        self.event_id    = event_id
+        self.room_number = room_number
 
-    approved = [r for r in regs if r["state"] == "approved"]
-    roster   = "\n".join(
-        f"{fe(r['army'])}  **{r['player_username']}**  ·  *{r['army']}*"
-        for r in approved
-    ) or "*No players confirmed yet.*"
+    @ui.button(label="📊  Submit Result", style=discord.ButtonStyle.success)
+    async def btn_submit_result(self, interaction: discord.Interaction, button: ui.Button):
+        game = db_get_game(self.game_id)
+        if not game:
+            await interaction.response.send_message("❌ Game not found.", ephemeral=True); return
+        if game["state"] in (GS.COMPLETE,):
+            await interaction.response.send_message("❌ Result already confirmed.", ephemeral=True); return
 
-    embed = discord.Embed(
-        title=f"🏆  {event['name']}",
-        description=f"**Warhammer 40,000  ·  Tabletop Simulator  ·  {fmt_label}**\n{SEP}",
-        color=COLOUR_GOLD,
-    )
-    embed.add_field(name="📅  Date",    value=dstr,                               inline=True)
-    embed.add_field(name="⚔️  Points",  value=f"**{event['points_limit']} pts**", inline=True)
-    embed.add_field(name="🎲  Format",  value=f"Swiss · **{total_rounds} rounds** · {event['rounds_per_day']}/day", inline=True)
-    embed.add_field(name=f"👥  Players  ({len(approved)}/{event['max_players']})",
-                    value=roster, inline=False)
-    if event.get("terrain_layout"):
-        embed.add_field(name="🏗️  Terrain", value=event["terrain_layout"], inline=False)
-    embed.set_footer(text="Pinned  ·  Updated by crew as registrations are confirmed")
-    return embed
+        uid = str(interaction.user.id)
+        if uid not in (game["player1_id"], game.get("player2_id", "")):
+            await interaction.response.send_message(
+                "❌ Only players in this game can submit results.", ephemeral=True); return
 
-def build_schedule_embed(event: dict) -> discord.Embed:
+        is_p1 = uid == game["player1_id"]
+        await interaction.response.send_modal(
+            ResultModal(self.game_id, self.event_id, is_p1, interaction.client)
+        )
+
+    @ui.button(label="⚖️  Judge Call", style=discord.ButtonStyle.danger)
+    async def btn_judge_call(self, interaction: discord.Interaction, button: ui.Button):
+        game = db_get_game(self.game_id)
+        if not game:
+            await interaction.response.send_message("❌ Game not found.", ephemeral=True); return
+
+        uid = str(interaction.user.id)
+        if uid not in (game["player1_id"], game.get("player2_id", "")):
+            await interaction.response.send_message(
+                "❌ Only players in this game can raise a judge call.", ephemeral=True); return
+
+        round_obj = db_get_current_round(self.event_id)
+        if not round_obj:
+            await interaction.response.send_message("❌ No active round.", ephemeral=True); return
+
+        call_id = db_create_judge_call(
+            self.event_id, round_obj["round_id"], self.game_id,
+            uid, interaction.user.display_name, self.room_number
+        )
+        db_queue_log(f"Judge call raised: Room {self.room_number} by {interaction.user.display_name}",
+                     self.event_id, level="judge")
+
+        # Update judge queue embed
+        await _refresh_judges_on_duty(interaction.client, self.event_id, interaction.guild)
+
+        # Ping judges in noticeboard
+        open_calls = db_get_open_calls(self.event_id)
+        queue_pos  = len(open_calls)
+        ch = interaction.guild.get_channel(EVENT_NOTICEBOARD_ID)
+        if ch:
+            # FIX: get_judges_for_guild takes only guild; availability derived from voice state
+            all_judges  = get_judges_for_guild(interaction.guild)
+            busy_judges = [j for j in all_judges if not j.get("available")]
+            available   = [j for j in all_judges if j.get("available")]
+            busy_note = (
+                f"\n⚠️ All judges currently busy — you are #{queue_pos} in queue."
+                if busy_judges and not available else ""
+            )
+            # Mention Crew role if configured, otherwise @here
+            role_mention = f"<@&{CREW_ROLE_ID}>" if CREW_ROLE_ID else "@here"
+            await ch.send(
+                f"⚖️ **JUDGE CALL — Room {self.room_number}** {role_mention}\n"
+                f"**{interaction.user.display_name}** · Round {round_obj['round_number']}"
+                f"{busy_note}",
+                silent=False,
+            )
+        await log_immediate(interaction.client, "Judge Call",
+            f"⚖️ Room {self.room_number} — **{interaction.user.display_name}**\n"
+            f"Call ID: `{call_id}`  ·  Queue position: #{queue_pos}",
+            COLOUR_CRIMSON)
+
+        await interaction.response.send_message(
+            f"✅ Judge call raised.\n"
+            f"A judge will be with you shortly."
+            + (f"\n⚠️ All judges are currently busy — you are #{queue_pos} in queue." if queue_pos > 1 else ""),
+            ephemeral=True,
+        )
+
+
+class JudgeQueueView(ui.View):
     """
-    Card 2 — Schedule.
-    Pinned by admin. Shows day/round breakdown and key times.
-    Admin edits the message manually if times change.
+    Persistent view on the judge queue embed in #event-noticeboard.
+    Any judge (Crew/admin) can acknowledge any open call — first click wins.
+    Each acknowledged call shows a Close button only to the claiming judge or any admin.
     """
-    total_rounds = event.get("round_count", 3)
-    rpd          = event["rounds_per_day"]
-    days         = math.ceil(total_rounds / rpd)
-    sd           = event["start_date"]
+    def __init__(self, event_id: str, calls: list):
+        super().__init__(timeout=None)
+        self.event_id = event_id
 
-    lines = []
-    round_counter = 1
-    for d in range(1, days + 1):
-        rounds_today = []
-        for _ in range(rpd):
-            if round_counter > total_rounds:
-                break
-            rounds_today.append(f"Round {round_counter}")
-            round_counter += 1
-        day_label = (sd + timedelta(days=d - 1)).strftime("%a %d %b") if hasattr(sd, "strftime") else f"Day {d}"
-        lines.append(f"**Day {d}  ·  {day_label}**\n" + "  ·  ".join(rounds_today))
+        # One Acknowledge button per OPEN call (up to 4 on row 0+1)
+        open_calls = [c for c in calls if c["state"] == JCS.OPEN]
+        for i, call in enumerate(open_calls[:4]):
+            btn = ui.Button(
+                label=f"🔔  Ack Room {call['room_number']}",
+                style=discord.ButtonStyle.primary,
+                custom_id=f"jq_ack_{call['call_id']}",
+                row=i // 2,
+            )
+            btn.callback = self._make_ack_cb(call["call_id"])
+            self.add_item(btn)
 
-    embed = discord.Embed(
-        title=f"📅  Schedule  —  {event['name']}",
-        description="\n\n".join(lines) or "*Schedule not yet set.*",
-        color=COLOUR_GOLD,
-    )
-    embed.set_footer(text="Pinned  ·  All times in UTC  ·  Check #event-noticeboard for round updates")
-    return embed
+        # One Close button per ACKNOWLEDGED call (up to 4 on row 2+3)
+        ack_calls = [c for c in calls if c["state"] == JCS.ACKNOWLEDGED]
+        for i, call in enumerate(ack_calls[:4]):
+            judge_name = call.get("acknowledged_by_name") or "Judge"
+            btn = ui.Button(
+                label=f"✅  Close Room {call['room_number']} ({judge_name})",
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"jq_close_{call['call_id']}",
+                row=2 + i // 2,
+            )
+            btn.callback = self._make_close_cb(call["call_id"])
+            self.add_item(btn)
 
-def build_missions_embed(event: dict) -> discord.Embed:
-    """
-    Card 3 — Missions.
-    Singles/2v2: shows the full round-by-round pairings table set at creation.
-    Team formats: shows the layout + mission pools captains draw from each ritual.
-    """
-    fmt = event.get("format", "singles")
+    def _make_ack_cb(self, call_id: str):
+        async def callback(interaction: discord.Interaction):
+            if not is_to(interaction):
+                await interaction.response.send_message("❌ Judges only.", ephemeral=True); return
 
-    embed = discord.Embed(
-        title=f"🗺️  Mission Pack  —  {event['name']}",
-        color=COLOUR_GOLD,
-    )
+            # Fetch call — check it's still open (race condition guard)
+            with get_conn() as conn:
+                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                    cur.execute("SELECT * FROM tournament_judge_calls WHERE call_id=%s", (call_id,))
+                    row = cur.fetchone()
+            if not row:
+                await interaction.response.send_message("❌ Call not found.", ephemeral=True); return
+            call = dict(row)
+            if call["state"] != JCS.OPEN:
+                await interaction.response.send_message(
+                    f"ℹ️ Call already acknowledged by **{call.get('acknowledged_by_name','another judge')}**.",
+                    ephemeral=True); return
 
-    if fmt in ("singles", "2v2"):
-        pairings = event.get("event_pairings") or []
-        if pairings:
-            lines = []
-            for i, p in enumerate(pairings):
-                m = db_get_mission(p["mission"])
-                lines.append(
-                    f"**Round {i+1}**  ·  Layout **{p['layout']}**  ·  "
-                    f"{m.get('name','?')}  (*{m.get('deployment','?')}*)"
+            judge_id   = str(interaction.user.id)
+            judge_name = interaction.user.display_name
+            db_update_judge_call(call_id, {
+                "state":               JCS.ACKNOWLEDGED,
+                "acknowledged_at":     datetime.utcnow(),
+                "acknowledged_by_id":  judge_id,
+                "acknowledged_by_name": judge_name,
+            })
+            # NOTE: judge_take_call() removed — availability derived from voice channel state,
+            # not tracked in memory. DB update above is the source of truth.
+
+            db_queue_log(
+                f"Judge {judge_name} acknowledged call {call_id} — Room {call['room_number']}",
+                self.event_id
+            )
+            await _refresh_judges_on_duty(interaction.client, self.event_id, interaction.guild)
+
+            # Notify the room
+            ch = interaction.guild.get_channel(EVENT_NOTICEBOARD_ID)
+            if ch:
+                await ch.send(
+                    f"⚖️ **{judge_name}** is heading to **Room {call['room_number']}** — on the way!",
+                    silent=True,
                 )
-            embed.add_field(name="📋  Round Pairings", value="\n".join(lines), inline=False)
-        else:
-            # Legacy fallback: single mission_code
-            m = db_get_mission(event["mission_code"])
-            embed.add_field(name="Mission",    value=f"**{m.get('name', '—')}**",           inline=True)
-            embed.add_field(name="Deployment", value=f"*{m.get('deployment', '—')}*",        inline=True)
-            embed.add_field(name="Layouts",    value=", ".join(m.get("layouts", [])) or "—", inline=False)
-    else:
-        layouts  = event.get("event_layouts")  or []
-        missions = event.get("event_missions") or []
-        layout_str  = ", ".join(f"Layout {l}" for l in layouts)  if layouts  else "⚠️ not configured"
-        mission_str = ", ".join(missions)                          if missions else "⚠️ not configured"
-        embed.add_field(name="🗺️  Layout pool",  value=layout_str,  inline=False)
-        embed.add_field(name="🎯  Mission pool", value=mission_str, inline=False)
-        embed.add_field(
-            name="ℹ️  Selection",
-            value="Captains choose layout and mission each round via the ritual.",
-            inline=False,
+            await interaction.response.send_message(
+                f"✅ You've taken Room {call['room_number']}. Close the call when you're done.",
+                ephemeral=True,
+            )
+        return callback
+
+    def _make_close_cb(self, call_id: str):
+        async def callback(interaction: discord.Interaction):
+            if not is_to(interaction):
+                await interaction.response.send_message("❌ Judges only.", ephemeral=True); return
+
+            # Only the claiming judge or any admin can close
+            with get_conn() as conn:
+                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                    cur.execute("SELECT * FROM tournament_judge_calls WHERE call_id=%s", (call_id,))
+                    row = cur.fetchone()
+            if not row:
+                await interaction.response.send_message("❌ Call not found.", ephemeral=True); return
+            call = dict(row)
+            uid  = str(interaction.user.id)
+            is_admin = interaction.user.guild_permissions.administrator or is_to(interaction)
+            is_claimer = uid == call.get("acknowledged_by_id")
+            if not is_admin and not is_claimer:
+                await interaction.response.send_message(
+                    f"❌ Only **{call.get('acknowledged_by_name','the claiming judge')}** or an admin can close this call.",
+                    ephemeral=True); return
+
+            await interaction.response.send_modal(
+                JudgeCloseModal(call_id, self.event_id, interaction.client, interaction.guild)
+            )
+        return callback
+
+
+class ResultConfirmationView(ui.View):
+    """Buttons on the pending result card in #event-submissions."""
+    def __init__(self, game_id: str, event_id: str, opponent_id: str):
+        super().__init__(timeout=None)
+        self.game_id     = game_id
+        self.event_id    = event_id
+        self.opponent_id = opponent_id
+
+    @ui.button(label="✅  Confirm", style=discord.ButtonStyle.success)
+    async def btn_confirm(self, interaction: discord.Interaction, button: ui.Button):
+        uid = str(interaction.user.id)
+        if uid != self.opponent_id and not is_to(interaction):
+            await interaction.response.send_message("❌ Only the opponent or a TO can confirm.", ephemeral=True); return
+        await interaction.response.defer()
+        await _confirm_game(interaction.client, self.game_id, interaction.message, interaction.guild)
+
+    @ui.button(label="⚠️  Dispute", style=discord.ButtonStyle.danger)
+    async def btn_dispute(self, interaction: discord.Interaction, button: ui.Button):
+        uid = str(interaction.user.id)
+        if uid != self.opponent_id and not is_to(interaction):
+            await interaction.response.send_message("❌ Only the opponent can dispute.", ephemeral=True); return
+        db_update_game(self.game_id, {"state": GS.DISPUTED})
+        game = db_get_game(self.game_id)
+        await interaction.response.edit_message(
+            embed=discord.Embed(
+                title=f"⚠️  Result Disputed — Room {game['room_number']}",
+                description="This result has been flagged for TO review.",
+                color=COLOUR_AMBER,
+            ),
+            view=None,
+        )
+        await log_immediate(interaction.client, "Result Disputed",
+            f"⚠️ Room {game['room_number']}: **{game['player1_username']}** vs **{game['player2_username']}**\n"
+            f"Disputed by {interaction.user.display_name}\nUse `/result override` to resolve.",
+            COLOUR_AMBER)
+        db_queue_log(f"Result disputed: Room {game['room_number']}", self.event_id, level="dispute")
+
+    @ui.button(label="⚡  TO Override", style=discord.ButtonStyle.secondary)
+    async def btn_override(self, interaction: discord.Interaction, button: ui.Button):
+        if not is_to(interaction):
+            await interaction.response.send_message("❌ TO only.", ephemeral=True); return
+        await interaction.response.defer()
+        await _confirm_game(interaction.client, self.game_id, interaction.message, interaction.guild)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MODALS
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ListSubmissionModal(ui.Modal, title="Submit Army List"):
+    list_text = ui.TextInput(
+        label="Paste your army list",
+        style=discord.TextStyle.paragraph,
+        placeholder="Include all units, points, detachment etc.",
+        max_length=2000,
+    )
+    def __init__(self, event_id: str, army: str, detachment: str):
+        super().__init__()
+        self.event_id   = event_id
+        self.army       = army
+        self.detachment = detachment
+
+    async def on_submit(self, interaction: discord.Interaction):
+        reg = db_get_registration(self.event_id, str(interaction.user.id))
+        if not reg:
+            await interaction.response.send_message("❌ You're not registered for this event.", ephemeral=True); return
+        db_upsert_registration(self.event_id, str(interaction.user.id),
+                                interaction.user.display_name,
+                                RS.PENDING, army=self.army,
+                                det=self.detachment, list_text=self.list_text.value)
+        event = db_get_event(self.event_id)
+        db_queue_log(f"{interaction.user.display_name} submitted list ({self.army} / {self.detachment})", self.event_id)
+
+        # Notify TO in submissions thread with Approve/Reject buttons
+        sub_thread = None
+        reg_obj = get_thread_reg(self.event_id)
+        if reg_obj.get("submissions"):
+            sub_thread = interaction.guild.get_thread(reg_obj["submissions"])
+        # Fallback: noticeboard channel
+        target = sub_thread or interaction.guild.get_channel(EVENT_NOTICEBOARD_ID)
+        if target:
+            from config import faction_colour
+            embed = discord.Embed(
+                title=f"📋  List Submitted — {interaction.user.display_name}",
+                description=(
+                    f"{fe(self.army)} **{self.army}**  ·  *{self.detachment}*\n\n"
+                    f"```\n{self.list_text.value[:400]}{'...' if len(self.list_text.value) > 400 else ''}\n```"
+                ),
+                color=faction_colour(self.army),
+            )
+            embed.add_field(name="Event", value=event["name"], inline=True)
+            embed.set_footer(text=f"TO: use buttons to approve or reject")
+            await target.send(
+                embed=embed,
+                view=RegistrationApprovalView(self.event_id, str(interaction.user.id))
+            )
+
+        await interaction.response.send_message(
+            f"✅ List submitted!\n"
+            f"{fe(self.army)} **{self.army}** · *{self.detachment}*\n"
+            f"Pending TO approval — you'll receive a DM when confirmed.",
+            ephemeral=True,
         )
 
-    scoring = (
-        "**Primary:** Secure objectives as per mission rules\n"
-        "**Secondary:** Chosen from your detachment's secondary options\n"
-        "**Max VP:** 100 per game"
-    )
-    embed.add_field(name="⚔️  Scoring", value=scoring, inline=False)
-    embed.set_footer(text="Pinned  ·  Refer to the current matched play rules pack for full details")
-    return embed
 
-def build_event_announcement_embed(event: dict) -> discord.Embed:
-    m = db_get_mission(event["mission_code"])
-    sd, ed = event["start_date"], event["end_date"]
-    multi  = sd != ed
-    dstr   = (f"{sd.strftime('%a %d %b')} — {ed.strftime('%a %d %b %Y')}"
-              if multi else sd.strftime("%A %d %B %Y"))
-    total_rounds = event.get("round_count", 3)
-    fmt = event.get("format", "singles")
-    fmt_label = {
-        "singles": "Singles", "2v2": "2v2",
-        "teams_3": "Teams 3s", "teams_5": "Teams 5s", "teams_8": "Teams 8s",
-    }.get(fmt, "Singles")
+class ResultModal(ui.Modal, title="Submit Game Result"):
+    p1_vp = ui.TextInput(label="Your VP score",       placeholder="e.g. 78", max_length=4)
+    p2_vp = ui.TextInput(label="Opponent's VP score", placeholder="e.g. 55", max_length=4)
 
-    embed = discord.Embed(
-        title=f"🏆  {event['name']}",
-        description=(
-            f"**Warhammer 40,000 · Tabletop Simulator · Swiss Tournament**\n"
-            f"**{fmt_label}  ·  {event['points_limit']} pts  ·  {total_rounds} rounds**\n"
-            f"{SEP}"
-        ),
-        color=COLOUR_GOLD,
-    )
-    embed.add_field(name="📅  Date",     value=dstr,                              inline=True)
-    embed.add_field(name="👥  Players",  value=f"Max **{event['max_players']}**", inline=True)
-    embed.add_field(name="🎲  Schedule", value=f"{total_rounds} rounds · {event['rounds_per_day']}/day", inline=True)
+    def __init__(self, game_id: str, event_id: str, is_player1: bool, bot_ref):
+        super().__init__()
+        self.game_id    = game_id
+        self.event_id   = event_id
+        self.is_player1 = is_player1
+        self.bot_ref    = bot_ref
 
-    # Mission / layout block — format-dependent
-    if fmt in ("singles", "2v2"):
-        pairings = event.get("event_pairings") or []
-        if pairings:
-            lines = [f"R{i+1}  ·  Layout **{p['layout']}**  ·  {p['mission']}" for i, p in enumerate(pairings)]
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            vp_me  = int(self.p1_vp.value.strip())
+            vp_opp = int(self.p2_vp.value.strip())
+        except ValueError:
+            await interaction.response.send_message("❌ VP scores must be numbers.", ephemeral=True); return
+        if not (0 <= vp_me <= 200 and 0 <= vp_opp <= 200):
+            await interaction.response.send_message("❌ VP must be between 0 and 200.", ephemeral=True); return
+
+        game = db_get_game(self.game_id)
+        if not game:
+            await interaction.response.send_message("❌ Game not found.", ephemeral=True); return
+        if game["state"] == GS.COMPLETE:
+            await interaction.response.send_message("❌ Result already confirmed.", ephemeral=True); return
+
+        p1_vp = vp_me  if self.is_player1 else vp_opp
+        p2_vp = vp_opp if self.is_player1 else vp_me
+        winner_id = game["player1_id"] if p1_vp >= p2_vp else game["player2_id"]
+
+        db_update_game(self.game_id, {
+            "player1_vp":   p1_vp,
+            "player2_vp":   p2_vp,
+            "winner_id":    winner_id,
+            "state":        GS.SUBMITTED,
+            "submitted_at": datetime.utcnow(),
+        })
+
+        winner_name = game["player1_username"] if winner_id == game["player1_id"] else game["player2_username"]
+        opponent_id = game["player2_id"] if self.is_player1 else game["player1_id"]
+
+        # Post pending result card to submissions thread (fallback: noticeboard)
+        reg_obj    = get_thread_reg(self.event_id)
+        sub_target = None
+        if reg_obj.get("submissions"):
+            sub_target = interaction.guild.get_thread(reg_obj["submissions"])
+        if not sub_target:
+            sub_target = interaction.guild.get_channel(EVENT_NOTICEBOARD_ID)
+        if sub_target:
+            embed = discord.Embed(
+                title=f"⏳  Pending Result  —  Room {game['room_number']}",
+                color=COLOUR_AMBER,
+            )
             embed.add_field(
-                name=f"🗺️  Round Pairings ({len(pairings)} rounds)",
-                value="\n".join(lines),
-                inline=False,
+                name=f"🔵 {game['player1_username']}",
+                value=f"{fe(game['player1_army'])} *{game['player1_army']}*",
+                inline=True,
             )
-        else:
-            # Fallback: show single mission as before
+            embed.add_field(name="\u200b", value=f"**{p1_vp} — {p2_vp}**", inline=True)
             embed.add_field(
-                name="🗺️  Mission",
-                value=f"**{m.get('name','—')}**\n*{m.get('deployment','—')}*\nLayouts: {', '.join(m.get('layouts',[]))}",
-                inline=False,
+                name=f"🔴 {game['player2_username']}",
+                value=f"{fe(game['player2_army'])} *{game['player2_army']}*",
+                inline=True,
             )
-    else:
-        # Team formats: show pools
-        layouts  = event.get("event_layouts") or []
-        missions = event.get("event_missions") or []
-        layout_str  = ", ".join(f"Layout {l}" for l in layouts)  if layouts  else "⚠️ not set"
-        mission_str = ", ".join(missions)                          if missions else "⚠️ not set"
-        embed.add_field(name="🗺️  Layout pool",  value=layout_str,  inline=True)
-        embed.add_field(name="🎯  Mission pool", value=mission_str, inline=True)
-
-    if event.get("terrain_layout"):
-        embed.add_field(name="🏗️  Terrain", value=event["terrain_layout"], inline=False)
-    embed.set_thumbnail(url="https://emojicdn.elk.sh/🏆?style=twitter")
-    embed.set_footer(text="Express interest below  ·  List submission required to confirm your spot")
-    return embed
-
-def build_briefing_embed(event: dict, round_number: int, day_number: int,
-                          players: List[dict]) -> discord.Embed:
-    m = db_get_mission(event["mission_code"])
-    roster = "\n".join(
-        f"{fe(p['army'])}  **{p['player_username']}**  ·  *{p['army']}*"
-        for p in players
-    )
-    embed = discord.Embed(
-        title=f"📢  Day {day_number} Briefing  —  {event['name']}",
-        description=f"**Round {round_number} pairings incoming — all players to the Briefing Room!**\n{SEP}",
-        color=COLOUR_GOLD,
-    )
-    embed.add_field(name="🗺️  Mission",    value=f"**{m.get('name','—')}**\n*{m.get('deployment','—')}*", inline=True)
-    embed.add_field(name="📐  Layouts",    value=", ".join(m.get("layouts", [])),                          inline=True)
-    embed.add_field(name="⚔️  Points",     value=f"**{event['points_limit']}** pts",                      inline=True)
-    embed.add_field(name=f"👥  Players  ({len(players)})", value=roster or "—",                           inline=False)
-    embed.set_footer(text="🔊 Join the Event Briefing Room voice channel")
-    return embed
-
-def build_pairings_embed(event: dict, round_obj: dict, games: List[dict], guild: discord.Guild) -> discord.Embed:
-    rnum     = round_obj["round_number"]
-    deadline = round_obj.get("deadline_at")
-
-    embed = discord.Embed(
-        title=f"⚔️  Round {rnum} Pairings  —  Day {round_obj['day_number']}",
-        description=(
-            f"**{event['name']}**\n"
-            f"Round closes {ts(deadline)}\n"
-            f"{SEP}"
-        ),
-        color=COLOUR_CRIMSON,
-    )
-
-    for g in games:
-        if g["is_bye"]:
-            embed.add_field(
-                name="🎲  BYE",
-                value=f"**{g['player1_username']}** — rest round\n*VP awarded at round close*",
-                inline=False,
+            embed.add_field(name="🏆  Winner", value=f"**{winner_name}**", inline=False)
+            embed.set_footer(text="Opponent: confirm below  ·  Dispute if incorrect  ·  Auto-confirms in 24h")
+            msg = await sub_target.send(
+                embed=embed,
+                view=ResultConfirmationView(self.game_id, self.event_id, opponent_id),
             )
-            continue
-
-        room = g.get("room_number")
-        vc = discord.utils.find(
-            lambda c: isinstance(c, discord.VoiceChannel) and c.name.startswith(GAME_ROOM_PREFIX)
-                      and c.name.endswith(str(room)),
-            guild.channels
-        )
-        room_link = f"[🔊 Join Room](<https://discord.com/channels/{guild.id}/{vc.id}>)" if vc else ""
-
-        status_icon = {GS.PENDING: "⏳", GS.SUBMITTED: "📋", GS.COMPLETE: "✅", GS.DISPUTED: "⚠️"}.get(g["state"], "⏳")
-
-        e1 = fe(g["player1_army"])
-        e2 = fe(g["player2_army"])
-        embed.add_field(
-            name=f"{status_icon}  Room {room}  {room_link}",
-            value=(
-                f"{e1} **{g['player1_username']}**\n"
-                f"*{g['player1_army']}*\n"
-                f"*{g['player1_detachment']}*"
-            ),
-            inline=True,
-        )
-        embed.add_field(name="​", value="**VS**", inline=True)
-        embed.add_field(
-            name="​",
-            value=(
-                f"{e2} **{g['player2_username']}**\n"
-                f"*{g['player2_army']}*\n"
-                f"*{g['player2_detachment']}*"
-            ),
-            inline=True,
-        )
-
-    embed.set_footer(text="Use the buttons below to submit results or call a judge  ·  Buttons are per-game")
-    return embed
-
-def build_spectator_dashboard_embed(
-    event: dict,
-    round_obj: Optional[dict],
-    games: List[dict],
-    standings: List[dict],
-    guild: discord.Guild,
-) -> discord.Embed:
-    """
-    Pinned card in #what's-playing-now.
-    Shows round status + VP standings for completed rounds only.
-    """
-    from database import db_get_results_by_player
-
-    live   = bool(round_obj and round_obj["state"] == RndS.IN_PROGRESS)
-    colour = COLOUR_CRIMSON if live else COLOUR_GOLD
-
-    rounds       = db_get_rounds(event["event_id"])
-    done_rounds  = sum(1 for r in rounds if r["state"] == RndS.COMPLETE)
-    total_rounds = event.get("round_count", 3)
-
-    # ── Title + status ────────────────────────────────────────────────────
-    if round_obj:
-        rnum = round_obj["round_number"]
-        if live:
-            deadline = round_obj.get("deadline_at")
-            status   = f"⏱️  Round ends {ts(deadline)}" if deadline else "🔴  In progress"
-        else:
-            status = "⏸️  Between rounds"
-        title = f"{'🔴 LIVE' if live else '📊'}  {event['name']}  —  Round {rnum}"
-    else:
-        status = "*Waiting for first round*"
-        title  = f"🏆  {event['name']}"
-
-    embed = discord.Embed(title=title, description=status, color=colour)
-
-    # ── Standings ─────────────────────────────────────────────────────────
-    field_name = (
-        f"📊  Standings  (after Round {done_rounds} of {total_rounds})"
-        if done_rounds else "📊  Standings"
-    )
-    if standings:
-        player_results = db_get_results_by_player(event["event_id"])
-        table = _standings_table(standings, done_rounds, player_results)
-        embed.add_field(name=field_name, value=table, inline=False)
-    else:
-        embed.add_field(name=field_name, value="*No results yet.*", inline=False)
-
-    # ── Footer ────────────────────────────────────────────────────────────
-    parts = []
-    if done_rounds > 0:
-        parts.append(f"After Round {done_rounds}")
-    parts.append(f"Last updated {datetime.utcnow().strftime('%H:%M')} UTC")
-    embed.set_footer(text="  ·  ".join(parts))
-
-    return embed
-
-def build_standings_embed(event: dict, standings: List[dict], final: bool = False) -> discord.Embed:
-    """
-    /standings command embed — completed rounds only, with total VP and VP diff.
-    """
-    from database import db_get_results_by_player
-
-    title  = f"🏆  Final Standings — {event['name']}" if final else f"📊  Standings — {event['name']}"
-    colour = COLOUR_GOLD if final else COLOUR_SLATE
-
-    if not standings:
-        return discord.Embed(title=title, description="No results yet.", color=colour)
-
-    rounds       = db_get_rounds(event["event_id"])
-    done_rounds  = sum(1 for r in rounds if r["state"] == RndS.COMPLETE)
-    total_rounds = event.get("round_count", 3)
-    p_results    = db_get_results_by_player(event["event_id"])
-
-    table = _standings_table(standings, done_rounds, p_results, include_totals=True)
-    embed = discord.Embed(title=title, description=table, color=colour)
-
-    if not final:
-        embed.set_footer(
-            text=(
-                f"Round {done_rounds}/{total_rounds}  ·  "
-                f"Format: VP + W/L/D per completed round  ·  "
-                f"Last updated {datetime.utcnow().strftime('%H:%M')} UTC"
+            db_update_game(self.game_id, {
+                "result_msg_id":     str(msg.id),
+                "result_channel_id": str(sub_target.id),
+            })
+            self.bot_ref.loop.create_task(
+                _auto_confirm_after_24h(self.bot_ref, self.game_id, msg, interaction.guild)
             )
+
+        db_queue_log(
+            f"Result submitted: Room {game['room_number']} — "
+            f"{game['player1_username']} {p1_vp}:{p2_vp} {game['player2_username']}",
+            self.event_id,
         )
-    else:
-        embed.set_footer(text="Tournament complete  ·  Results submitted to Scorebot for ELO calculation")
-
-    return embed
-
-def build_team_standings_embed(event: dict, standings: List[dict], final: bool = False) -> discord.Embed:
-    """Team-format standings table: team_points → game_points → vp_diff."""
-    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
-    fmt_label = event.get("format", "singles").replace("_", " ").title()
-    title  = (f"🏆  Final Standings — {event['name']}" if final
-              else f"📊  Team Standings — {event['name']}  [{fmt_label}]")
-    colour = COLOUR_GOLD if final else COLOUR_SLATE
-
-    if not standings:
-        return discord.Embed(title=title, description="No results yet.", color=colour)
-
-    header = f"{'':3} {'Team':<22} {'TP':>2} {'W':>2} {'L':>2} {'D':>2} {'GP':>4} {'VPΔ':>5}"
-    sep_   = "─" * len(header)
-    lines  = ["```", header, sep_]
-    for i, s in enumerate(standings, 1):
-        medal = medals.get(i, f"  {i}.")
-        name  = s["team_name"][:20]
-        lines.append(
-            f"{medal:<3} {name:<22} {s.get('team_points',0):>2} "
-            f"{s.get('team_wins',0):>2} {s.get('team_losses',0):>2} {s.get('team_draws',0):>2} "
-            f"{s.get('game_points',0):>4} {s.get('vp_diff',0):>+5}"
+        await interaction.response.send_message(
+            f"✅ Result submitted!\n**{p1_vp} — {p2_vp}**\nWaiting for opponent confirmation.",
+            ephemeral=True,
         )
-    lines.append("```")
-    lines.append("*TP=Tournament Points  GP=Game Points  VPΔ=VP differential*")
 
-    embed = discord.Embed(title=title, description="\n".join(lines), color=colour)
-    if not final:
-        rounds = db_get_rounds(event["event_id"])
-        done   = sum(1 for r in rounds if r["state"] == RndS.COMPLETE)
-        total  = event.get("round_count", 3)
-        embed.set_footer(text=f"Round {done}/{total}  ·  Primary: Tournament Points  ·  Secondary: Game Points")
-    else:
-        embed.set_footer(text="Tournament complete")
-    return embed
 
-def build_list_review_header(event: dict, regs: list) -> discord.Embed:
-    """
-    Header card for the Army Lists thread.
-    Submission checklist — submitted vs missing.
-    """
-    submitted = [r for r in regs if r.get("list_text")]
-    missing   = [r for r in regs if not r.get("list_text")]
+class RejectionReasonModal(ui.Modal, title="Rejection Reason"):
+    reason = ui.TextInput(label="Reason (shown to player)", max_length=200,
+                           placeholder="e.g. List over points limit, missing required units")
 
-    lines = []
-    for r in submitted:
-        lines.append(f"✅  {fe(r['army'])} **{r['player_username']}**")
-    for r in missing:
-        lines.append(f"⏳  **{r['player_username']}** — *list not submitted*")
+    def __init__(self, event_id: str, player_id: str, original_message):
+        super().__init__()
+        self.event_id        = event_id
+        self.player_id       = player_id
+        self.original_message = original_message
 
-    embed = discord.Embed(
-        title=f"📋  Army Lists  —  {event['name']}",
-        description="\n".join(lines) or "*No registrations found.*",
-        color=COLOUR_GOLD,
-    )
-    embed.add_field(name="✅  Submitted", value=str(len(submitted)), inline=True)
-    embed.add_field(name="⏳  Missing",   value=str(len(missing)),   inline=True)
-    embed.set_footer(text="Individual lists follow below  ·  Scroll down to review")
-    return embed
+    async def on_submit(self, interaction: discord.Interaction):
+        reg = db_get_registration(self.event_id, self.player_id)
+        if not reg:
+            await interaction.response.send_message("❌ Not found.", ephemeral=True); return
+        db_update_registration(self.event_id, self.player_id,
+                                {"state": RS.REJECTED, "rejection_reason": self.reason.value})
+        event = db_get_event(self.event_id)
+        try:
+            user = await interaction.client.fetch_user(int(self.player_id))
+            await user.send(
+                f"❌ **Registration rejected for {event['name']}**\n"
+                f"Reason: {self.reason.value}\n"
+                f"Contact the TO if you have questions."
+            )
+        except: pass
+        await log_immediate(interaction.client, "Registration Rejected",
+            f"❌ {reg['player_username']} rejected from {event['name']}\nReason: {self.reason.value}",
+            COLOUR_CRIMSON)
+        await interaction.response.edit_message(
+            content=f"❌ **{reg['player_username']}** rejected. Player notified.",
+            embed=None, view=None,
+        )
 
-def build_player_list_embed(reg: dict, index: int) -> discord.Embed:
-    """
-    Individual army list card in the Army Lists thread.
-    Long names are handled — embed title truncates gracefully,
-    full name shown inside the description.
-    """
-    army      = reg["army"]
-    det       = reg["detachment"]
-    emoji     = fe(army)
-    colour    = faction_colour(army)
-    full_name = reg["player_username"]
-    # Truncate only the embed title (Discord limit 256), keep full name in body
-    title_name = full_name[:50] + ("…" if len(full_name) > 50 else "")
 
-    list_text = reg.get("list_text") or "*No list submitted*"
-    # Discord field value limit is 1024 chars
-    if len(list_text) > 950:
-        list_text = list_text[:950] + "\n*[truncated — contact player for full list]*"
+class VPAdjustModal(ui.Modal, title="Adjust Result VPs"):
+    new_p1_vp = ui.TextInput(label="Player 1 VP (corrected)", max_length=4)
+    new_p2_vp = ui.TextInput(label="Player 2 VP (corrected)", max_length=4)
+    note      = ui.TextInput(label="Reason for adjustment", max_length=200,
+                              placeholder="e.g. Judge ruling — illegal unit removed")
 
-    embed = discord.Embed(
-        title=f"{emoji}  {title_name}",
-        description=f"**{full_name}**\n{army}  ·  *{det}*",
-        color=colour,
-    )
-    embed.add_field(name="📜  Army List", value=f"```\n{list_text}\n```", inline=False)
-    if reg.get("submitted_at"):
-        embed.set_footer(text=f"Submitted {reg['submitted_at'].strftime('%d %b %Y  %H:%M UTC')}")
-    return embed
+    def __init__(self, game_id: str, event_id: str, bot_ref, guild):
+        super().__init__()
+        self.game_id  = game_id
+        self.event_id = event_id
+        self.bot_ref  = bot_ref
+        self.guild    = guild
 
-def build_judges_on_duty_embed(
-    guild: discord.Guild,
-    round_obj: Optional[dict] = None,
-) -> discord.Embed:
-    """
-    Read-only Judges on Duty card.
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            new_p1 = int(self.new_p1_vp.value.strip())
+            new_p2 = int(self.new_p2_vp.value.strip())
+        except ValueError:
+            await interaction.response.send_message("❌ VP must be numbers.", ephemeral=True); return
 
-    Availability is derived purely from voice channel presence:
-      🟢 available  — not in any Game Room (safe to DM)
-      🔵 in-game    — currently in a Game Room (judging a match)
+        game = db_get_game(self.game_id)
+        if not game:
+            await interaction.response.send_message("❌ Game not found.", ephemeral=True); return
 
-    Players should DM a 🟢 available judge directly.
-    VP adjustments applied by crew via /result adjust after the round.
-    """
-    judges    = get_judges_for_guild(guild)
-    available = [j for j in judges if j["available"]]
-    in_game   = [j for j in judges if not j["available"]]
+        old_p1 = game.get("player1_vp", 0) or 0
+        old_p2 = game.get("player2_vp", 0) or 0
+        old_winner = game.get("winner_id")
+        old_loser  = game["player2_id"] if old_winner == game["player1_id"] else game["player1_id"]
 
-    # Card colour reflects whether anyone is free
-    if not judges:
-        colour = COLOUR_SLATE
-    elif available:
-        colour = discord.Color.green()
-    else:
-        colour = COLOUR_AMBER
+        # Reverse old result from standings
+        if old_winner:
+            db_reverse_result_from_standings(self.event_id, old_winner, old_loser, old_p1, old_p2)
 
-    title = "⚖️  Judges on Duty"
+        # Apply new result
+        new_winner_id = game["player1_id"] if new_p1 >= new_p2 else game["player2_id"]
+        new_loser_id  = game["player2_id"] if new_winner_id == game["player1_id"] else game["player1_id"]
+        db_apply_result_to_standings(self.event_id, new_winner_id, new_loser_id, new_p1, new_p2)
 
-    # Build roster lines
-    lines: list[str] = []
-    for j in available:
-        lines.append(f"🟢  **{j['name']}** — available  ·  {j['mention']}")
-    for j in in_game:
-        lines.append(f"🔵  **{j['name']}** — {j['room']}")
-    if not judges:
-        lines = ["*No judges currently assigned.*"]
+        db_update_game(self.game_id, {
+            "player1_vp": new_p1,
+            "player2_vp": new_p2,
+            "winner_id":  new_winner_id,
+            "adj_note":   self.note.value,
+        })
 
-    embed = discord.Embed(
-        title=title,
-        description="\n".join(lines),
-        color=colour,
+        new_winner_name = game["player1_username"] if new_winner_id == game["player1_id"] else game["player2_username"]
+        await log_immediate(self.bot_ref, "VP Adjustment",
+            f"🔧 Room {game['room_number']}: **{game['player1_username']}** {new_p1}—{new_p2} **{game['player2_username']}**\n"
+            f"*(was {old_p1}—{old_p2})*\nWinner: **{new_winner_name}**\nReason: {self.note.value}\n"
+            f"Adjusted by {interaction.user.display_name}",
+            COLOUR_AMBER)
+        db_queue_log(
+            f"VP adjusted: Room {game['room_number']} — {old_p1}:{old_p2} → {new_p1}:{new_p2}  ({self.note.value})",
+            self.event_id, level="adjust"
+        )
+        await refresh_spectator_dashboard(self.bot_ref, self.event_id)
+        await interaction.response.send_message(
+            f"✅ Result adjusted.\n**{new_p1} — {new_p2}**  Winner: **{new_winner_name}**",
+            ephemeral=True,
+        )
+
+
+class JudgeCloseModal(ui.Modal, title="Close Judge Call"):
+    vp_adj = ui.TextInput(
+        label="VP adjustment (leave blank if none)",
+        required=False,
+        max_length=100,
+        placeholder="e.g. Room 3 P1 -5 VP — illegal model"
     )
 
-    if available:
-        embed.add_field(
-            name="📩  Need a ruling?",
-            value=(
-                "DM a 🟢 available judge directly.\n"
-                "They will come to your Game Room."
-            ),
-            inline=False,
-        )
-    else:
-        embed.add_field(
-            name="📩  All judges are in a game",
-            value=(
-                "Wait for a judge to finish their current room — "
-                "this card updates automatically."
-            ),
-            inline=False,
+    def __init__(self, call_id: str, event_id: str, bot_ref, guild):
+        super().__init__()
+        self.call_id  = call_id
+        self.event_id = event_id
+        self.bot_ref  = bot_ref
+        self.guild    = guild
+
+    async def on_submit(self, interaction: discord.Interaction):
+        adj        = self.vp_adj.value.strip() if self.vp_adj.value else None
+        judge_id   = str(interaction.user.id)
+        judge_name = interaction.user.display_name
+        db_update_judge_call(self.call_id, {
+            "state":          JCS.CLOSED,
+            "closed_at":      datetime.utcnow(),
+            "closed_by_id":   judge_id,
+            "closed_by_name": judge_name,
+            "vp_adjustment":  adj,
+        })
+        # NOTE: judge_release_call() removed — availability derived from voice channel state,
+        # not tracked in memory. DB update above is the source of truth.
+
+        db_queue_log(
+            f"Judge {judge_name} closed call {self.call_id}"
+            + (f" — VP adj: {adj}" if adj else ""),
+            self.event_id
         )
 
-    # Footer — round info + last updated timestamp
-    parts = []
-    if round_obj:
-        parts.append(f"Round {round_obj['round_number']}")
-    parts.append(f"Last updated {datetime.utcnow().strftime('%H:%M')} UTC")
-    embed.set_footer(text="  ·  ".join(parts))
+        if adj:
+            await log_immediate(self.bot_ref, "Judge Ruling — VP Adjustment Noted",
+                f"⚖️ Call `{self.call_id}` closed by **{judge_name}**\n"
+                f"Noted adjustment: *{adj}*\n"
+                f"Use `/result adjust` to apply the VP change to standings.",
+                COLOUR_AMBER)
 
-    return embed
+        await _refresh_judges_on_duty(self.bot_ref, self.event_id, self.guild)
+        await interaction.response.send_message(
+            f"✅ Call `{self.call_id}` closed."
+            + (f"\n📝 Adjustment noted: *{adj}*\nApply with `/result adjust` if needed." if adj else ""),
+            ephemeral=True,
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GAME RESULT LIFECYCLE HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _confirm_game(bot, game_id: str, message: discord.Message, guild: discord.Guild):
+    game = db_get_game(game_id)
+    if not game or game["state"] == GS.COMPLETE:
+        return
+
+    p1_vp     = game["player1_vp"] or 0
+    p2_vp     = game["player2_vp"] or 0
+    winner_id = game["winner_id"]
+    loser_id  = game["player2_id"] if winner_id == game["player1_id"] else game["player1_id"]
+
+    db_update_game(game_id, {"state": GS.COMPLETE, "confirmed_at": datetime.utcnow()})
+    db_apply_result_to_standings(game["event_id"], winner_id, loser_id, p1_vp, p2_vp)
+
+    winner_name = game["player1_username"] if winner_id == game["player1_id"] else game["player2_username"]
+    col  = room_colour(game.get("room_number"))
+    embed = discord.Embed(
+        title=f"✅  Result Confirmed  —  Room {game['room_number']}",
+        color=col,
+    )
+    embed.add_field(name=f"🔵 {game['player1_username']}", value=f"{fe(game['player1_army'])}", inline=True)
+    embed.add_field(name="\u200b", value=f"**{p1_vp} — {p2_vp}**", inline=True)
+    embed.add_field(name=f"🔴 {game['player2_username']}", value=f"{fe(game['player2_army'])}", inline=True)
+    embed.add_field(name="🏆  Winner", value=f"**{winner_name}**", inline=False)
+    embed.set_footer(text="Confirmed  ·  Results held until event closes, then submitted to Scorebot")
+
+    await message.edit(embed=embed, view=None)
+    db_queue_log(
+        f"Result confirmed: Room {game['room_number']} — "
+        f"{game['player1_username']} {p1_vp}:{p2_vp} {game['player2_username']} → {winner_name}",
+        game["event_id"],
+    )
+    await refresh_spectator_dashboard(bot, game["event_id"])
+
+async def _auto_confirm_after_24h(bot, game_id: str, message: discord.Message, guild: discord.Guild):
+    await asyncio.sleep(86400)
+    game = db_get_game(game_id)
+    if game and game["state"] == GS.SUBMITTED:
+        await _confirm_game(bot, game_id, message, guild)
