@@ -305,6 +305,7 @@ event_grp = app_commands.Group(
     max_players= "Singles: max players (8/16/32)",
     max_teams  = "2v2 / Teams: max teams (2-5)",
     team_size  = "Teams: players per team (3, 5, or 8)",
+    scoring_mode = "Teams 3/5/8 scoring system (default: NTL)",
 )
 @app_commands.choices(
     format=[
@@ -330,6 +331,10 @@ event_grp = app_commands.Group(
         app_commands.Choice(name="5 players per team", value=5),
         app_commands.Choice(name="8 players per team", value=8),
     ],
+    scoring_mode=[
+        app_commands.Choice(name="NTL (ratio-scaled thresholds)",   value="ntl"),
+        app_commands.Choice(name="WTC (fixed 75/85 GP thresholds)", value="wtc"),
+    ],
 )
 async def event_create(
     interaction: discord.Interaction,
@@ -339,6 +344,7 @@ async def event_create(
     max_players: Optional[int] = None,
     max_teams:   Optional[int] = None,
     team_size:   Optional[int] = None,
+    scoring_mode: str = "ntl",
 ):
     if not is_to(interaction):
         await interaction.response.send_message("❌ TO only.", ephemeral=True)
@@ -439,6 +445,8 @@ async def event_create(
         "state":             ES.INTEREST,
         "rules_cutoff":      str(rules_cutoff),
         "reg_deadline":      str(reg_deadline),
+        # WTC scoring mode only applies to team formats; singles/2v2 always use NTL
+        "scoring_mode":      scoring_mode if format in ("teams_3", "teams_5", "teams_8") else "ntl",
     })
 
     event = db_get_event(eid)
