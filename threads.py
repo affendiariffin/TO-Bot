@@ -17,13 +17,13 @@ Sections:
 Imported by: services.py, commands_*.py, ritual.py
 """
 import discord
-import asyncio, math, re
-import psycopg2.extras
+import asyncio, math, re  # FIX: added `re` (used in assign_rooms)
+import psycopg2.extras    # FIX: needed for RealDictCursor in db_get_team_standings
 from datetime import datetime
 from typing import List, Optional, Dict
 from config import (EVENT_NOTICEBOARD_ID, CREW_ROLE_ID, PLAYER_ROLE_ID,
                     CAPTAINS_ROLE_ID, GUILD_ID, GAME_ROOM_PREFIX)
-from state import get_thread_reg, thread_registry
+from state import get_thread_reg, thread_registry, RS  # FIX: added RS (used in ensure_submissions_thread)
 from database import *
 
 # ══════════════════════════════════════════════════════════════════════════════
