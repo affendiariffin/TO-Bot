@@ -122,8 +122,7 @@ async def round_start(interaction: discord.Interaction, event_id: str, duration_
             "player1_army": bye_player["army"],     "player1_detachment": bye_player["detachment"],
             "is_bye": True,
         })
-
-    round_obj    = db_get_round(round_id)
+        db_update_standing(event_id, bye_player["player_id"], {"had_bye": True})  # FIX: was missing, allowed repeat byes
     all_games    = db_get_games(round_id)
     ch           = interaction.guild.get_channel(EVENT_NOTICEBOARD_ID)
     round_thread = None
