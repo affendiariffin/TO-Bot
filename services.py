@@ -19,9 +19,10 @@ from discord import app_commands
 from datetime import datetime
 from typing import List
 from config import (WHATS_PLAYING_ID, EVENT_NOTICEBOARD_ID, BOT_LOGS_ID,
-                    WARHAMMER_ARMIES, WARHAMMER_DETACHMENTS, TOURNAMENT_MISSIONS)
-from state import get_thread_reg, GS, RS
+                    TOURNAMENT_MISSIONS)
+# FIX: import live faction data from database cache instead of stale static config lists
 from database import *
+from state import get_thread_reg, GS, RS
 from embeds import build_spectator_dashboard_embed, build_judges_on_duty_embed, build_standings_embed
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -137,12 +138,15 @@ async def ac_missions(i: discord.Interaction, current: str):
     ][:25]
 
 async def ac_armies(i: discord.Interaction, current: str):
+    # FIX: use live DB cache (db_get_army_names) instead of static WARHAMMER_ARMIES from config
     return [app_commands.Choice(name=a, value=a)
-            for a in WARHAMMER_ARMIES if current.lower() in a.lower()][:25]
+            for a in db_get_army_names() if current.lower() in a.lower()][:25]
 
 async def ac_detachments(i: discord.Interaction, current: str):
     army = getattr(i.namespace, "army", "") or ""
-    dets = WARHAMMER_DETACHMENTS.get(army, ["Other"])
+    # FIX: use live DB cache (_detachments_cache via db_get_factions) instead of static config dict
+    factions = db_get_factions()
+    dets = _detachments_cache.get(army, ["Other"]) if army in factions else ["Other"]
     return [app_commands.Choice(name=d, value=d)
             for d in dets if current.lower() in d.lower()][:25]
 
