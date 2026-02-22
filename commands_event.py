@@ -27,7 +27,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict
 from config import (GUILD_ID, GUILD, EVENT_NOTICEBOARD_ID, WHATS_PLAYING_ID,
                     COLOUR_GOLD, COLOUR_CRIMSON, COLOUR_AMBER, COLOUR_SLATE,
-                    WARHAMMER_ARMIES, TOURNAMENT_MISSIONS, fe, faction_colour)
+                    TOURNAMENT_MISSIONS, fe, faction_colour)
 from state import ES, RS, FMT, is_to, get_thread_reg
 from database import *
 from threads import (ensure_submissions_thread, ensure_lists_thread,
