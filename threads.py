@@ -17,7 +17,8 @@ Sections:
 Imported by: services.py, commands_*.py, ritual.py
 """
 import discord
-import asyncio, math, re  # FIX: added `re` (used in assign_rooms)
+import asyncio, math, re
+import psycopg2.extras
 from datetime import datetime
 from typing import List, Optional, Dict
 from config import (EVENT_NOTICEBOARD_ID, CREW_ROLE_ID, PLAYER_ROLE_ID,
