@@ -37,13 +37,14 @@ import discord
 from discord import ui
 import asyncio
 
-from config import (COLOUR_GOLD, COLOUR_AMBER, TOURNAMENT_MISSIONS, fe)
+from config import (COLOUR_GOLD, COLOUR_AMBER, fe)
 from state import FMT
 from database import (
     db_get_event, db_get_team, db_get_team_members,
     db_get_team_round, db_update_team_round,
     db_get_pairing_state, db_update_pairing_state,
     db_create_team_pairing, db_get_team_pairings, db_update_team_pairing,
+    db_get_mission,
 )
 
 
@@ -100,7 +101,7 @@ class SelectMission8sView(ui.View):
         self.slot       = slot
         options = []
         for code in valid_missions:
-            m = TOURNAMENT_MISSIONS.get(code, {})
+            m = db_get_mission(code)
             options.append(discord.SelectOption(
                 label=f"{code}: {m.get('name', code)}",
                 value=code,
