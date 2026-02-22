@@ -982,38 +982,34 @@ _detachments_cache: dict[str, list] = {}
 
 def init_factions_cache():
     """
-    Load all active factions and their detachments from DB into memory.
+    Load all factions and their detachments from DB into memory.
+    Uses the existing 'armies' and 'detachments' tables.
     Call once at startup. Re-call after DB edits via /faction reload.
     """
     global _factions_cache, _detachments_cache
     with get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("""
-                SELECT army_name, emoji, colour_r, colour_g, colour_b, sort_order
-                FROM warhammer_factions
-                WHERE active = TRUE
-                ORDER BY sort_order, army_name
+                SELECT a.id, a.name, a.emoji,
+                       d.name AS detachment_name
+                FROM armies a
+                LEFT JOIN detachments d ON d.army_id = a.id
+                ORDER BY a.id, d.name
             """)
-            factions = cur.fetchall()
-            cur.execute("""
-                SELECT army_name, detachment_name
-                FROM warhammer_detachments
-                WHERE active = TRUE
-                ORDER BY army_name, sort_order, detachment_name
-            """)
-            detachments = cur.fetchall()
+            rows = cur.fetchall()
 
-    _factions_cache = {
-        r["army_name"]: {
-            "emoji":      r["emoji"],
-            "colour":     (r["colour_r"], r["colour_g"], r["colour_b"]),
-            "sort_order": r["sort_order"],
-        }
-        for r in factions
-    }
+    _factions_cache = {}
     _detachments_cache = {}
-    for r in detachments:
-        _detachments_cache.setdefault(r["army_name"], []).append(r["detachment_name"])
+    for r in rows:
+        army = r["name"]
+        if army not in _factions_cache:
+            _factions_cache[army] = {
+                "emoji":      r["emoji"] or "⚔️",
+                "colour":     (100, 100, 100),
+                "sort_order": r["id"],
+            }
+        if r["detachment_name"]:
+            _detachments_cache.setdefault(army, []).append(r["detachment_name"])
 
     print(f"✅ Factions cache loaded ({len(_factions_cache)} factions, "
           f"{sum(len(v) for v in _detachments_cache.values())} detachments)")
