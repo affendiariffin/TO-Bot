@@ -30,7 +30,7 @@ from datetime import datetime, timezone
 from typing import Optional
 from config import (COLOUR_GOLD, COLOUR_CRIMSON, COLOUR_AMBER, COLOUR_SLATE,
                     CREW_ROLE_ID, EVENT_NOTICEBOARD_ID,
-                    TOURNAMENT_MISSIONS, fe, room_colour)
+                    fe, room_colour)
 from state import GS, RS, JCS, ES, is_to, get_thread_reg, get_judges_for_guild
 from database import *
 from threads import ensure_submissions_thread, calculate_rounds
@@ -89,7 +89,7 @@ class EventAnnouncementView(ui.View):
                custom_id="btn_event_details")
     async def btn_details(self, interaction: discord.Interaction, button: ui.Button):
         event = db_get_event(self.event_id)
-        m = TOURNAMENT_MISSIONS.get(event["mission_code"], {})
+        m = db_get_mission(event["mission_code"])
         embed = discord.Embed(
             title=f"📋  {event['name']}  —  Details",
             color=COLOUR_GOLD,
