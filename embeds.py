@@ -111,6 +111,121 @@ def _standings_table(
 # EMBED BUILDERS  —  TV-bot design language
 # ══════════════════════════════════════════════════════════════════════════════
 
+def build_singles_event_card(
+    event: dict,
+    regs: list,
+    deadline_passed: bool = False,
+) -> discord.Embed:
+    """
+    The main registration card for a singles event (posted at creation, updated live).
+
+    Three registration sections:
+      ✅ Confirmed  (RS.APPROVED)
+      ✊ Chop       (RS.PENDING)   — hidden when deadline_passed=True
+      🖐️ Reserve    (RS.INTERESTED) — hidden when deadline_passed=True
+
+    Also shows: schedule (KL time), rules cutoff, registration deadline.
+    """
+    from state import RS as _RS
+
+    sd    = event["start_date"]
+    multi = event["start_date"] != event["end_date"]
+    dstr  = (
+        f"{sd.strftime('%a %d %b')} — {event['end_date'].strftime('%a %d %b %Y')}"
+        if multi else sd.strftime("%A %d %B %Y")
+    )
+    round_count = event.get("round_count", 3)
+    day_label   = "1 day" if round_count == 3 else "2 days"
+
+    confirmed_regs = [r for r in regs if r["state"] == _RS.APPROVED]
+    chop_regs      = [r for r in regs if r["state"] == _RS.PENDING]
+    reserve_regs   = [r for r in regs if r["state"] == _RS.INTERESTED]
+
+    def _roster(lst, icon=""):
+        if not lst:
+            return "*None yet*"
+        return "\n".join(f"{icon} {fe(r['army'])} **{r['player_username']}**" for r in lst)
+
+    embed = discord.Embed(
+        title=f"🏆  {event['name']}",
+        description=(
+            f"**Warhammer 40,000  ·  Tabletop Simulator  ·  Singles**\n"
+            f"{event['points_limit']} pts  ·  **{round_count} rounds**  ·  {day_label}\n"
+            f"{SEP}"
+        ),
+        color=COLOUR_GOLD,
+    )
+    embed.add_field(name="📅  Date",        value=dstr,                    inline=True)
+    embed.add_field(name="👥  Max Players", value=str(event["max_players"]), inline=True)
+    embed.add_field(name="🎲  Rounds",      value=f"{round_count} · Swiss", inline=True)
+
+    # Schedule — use pre-built slots injected at creation time if available
+    sched_slots: list = event.get("_schedule_slots") or []
+    if sched_slots:
+        sched_lines = []
+        for s in sched_slots:
+            ts_s = f"<t:{int(s['start_dt'].timestamp())}:t>"
+            ts_e = f"<t:{int(s['end_dt'].timestamp())}:t>"
+            sched_lines.append(f"{s['label']}  {ts_s}–{ts_e}")
+        embed.add_field(name="🕗  Schedule (KL time)", value="\n".join(sched_lines), inline=False)
+    else:
+        embed.add_field(name="🕗  Start Time", value=f"**8:30am KL time** on {dstr}", inline=False)
+
+    # Key dates (rules cutoff + reg deadline)
+    from datetime import datetime as _dtm, date as _date
+    rules_cutoff = event.get("_rules_cutoff") or event.get("rules_cutoff")
+    reg_deadline = event.get("_reg_deadline") or event.get("reg_deadline")
+    date_lines: list[str] = []
+    for label, val, fmt in [
+        ("📋  Rules cutoff",        rules_cutoff, "Submitted lists must comply with rules as of this date"),
+        ("⏰  Registration closes", reg_deadline,  ""),
+    ]:
+        if not val:
+            continue
+        if isinstance(val, str):
+            try:
+                val = _dtm.strptime(val, "%Y-%m-%d").date()
+            except Exception:
+                continue
+        date_lines.append(f"{label}: **{val.strftime('%a %d %b %Y')}**")
+    if date_lines:
+        embed.add_field(name="📅  Key Dates", value="\n".join(date_lines), inline=False)
+
+    # Registration sections
+    if not deadline_passed:
+        embed.add_field(
+            name=f"✅  Confirmed  ({len(confirmed_regs)}/{event['max_players']})",
+            value=_roster(confirmed_regs, "✅"),
+            inline=False,
+        )
+        embed.add_field(
+            name=f"✊  Chop  ({len(chop_regs)})",
+            value=_roster(chop_regs, "✊"),
+            inline=True,
+        )
+        embed.add_field(
+            name=f"🖐️  Reserve  ({len(reserve_regs)})",
+            value=_roster(reserve_regs, "🖐️"),
+            inline=True,
+        )
+        embed.set_footer(
+            text=(
+                "Click Chop ✊ to register and submit your list  ·  "
+                "TO reviews and confirms your spot  ·  "
+                "Lists are private until registration closes"
+            )
+        )
+    else:
+        embed.add_field(
+            name=f"✅  Confirmed Players  ({len(confirmed_regs)}/{event['max_players']})",
+            value=_roster(confirmed_regs, "✅"),
+            inline=False,
+        )
+        embed.set_footer(text="Registration closed · Army lists published in the thread above")
+
+    return embed
+
+
 def build_event_main_embed(event: dict, regs: list) -> discord.Embed:
     """
     Card 1 — Event Main Details.
