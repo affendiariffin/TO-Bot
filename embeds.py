@@ -25,10 +25,10 @@ import math
 from datetime import datetime, timedelta
 from typing import List, Optional
 from config import (COLOUR_GOLD, COLOUR_CRIMSON, COLOUR_AMBER, COLOUR_SLATE,
-                    SEP, GAME_ROOM_PREFIX, TOURNAMENT_MISSIONS,
+                    SEP, GAME_ROOM_PREFIX,
                     fe, faction_colour, room_colour, ts, ts_full)
 from state import GS, RndS, JCS, FMT, get_judges_for_guild
-from database import db_get_rounds
+from database import db_get_rounds, db_get_mission
 from threads import calculate_rounds
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -118,7 +118,7 @@ def build_event_main_embed(event: dict, regs: list) -> discord.Embed:
     Pinned by admin in #event-noticeboard.
     Shows core event info + current player roster.
     """
-    m           = TOURNAMENT_MISSIONS.get(event["mission_code"], {})
+    m           = db_get_mission(event["mission_code"])
     sd, ed      = event["start_date"], event["end_date"]
     multi       = sd != ed
     dstr        = (f"{sd.strftime('%a %d %b')} — {ed.strftime('%a %d %b %Y')}"
@@ -186,7 +186,7 @@ def build_missions_embed(event: dict) -> discord.Embed:
     Card 3 — Missions.
     Shows the mission pack info for the event.
     """
-    m = TOURNAMENT_MISSIONS.get(event["mission_code"], {})
+    m = db_get_mission(event["mission_code"])
 
     embed = discord.Embed(
         title=f"🗺️  Mission Pack  —  {event['name']}",
@@ -206,7 +206,7 @@ def build_missions_embed(event: dict) -> discord.Embed:
     return embed
 
 def build_event_announcement_embed(event: dict) -> discord.Embed:
-    m = TOURNAMENT_MISSIONS.get(event["mission_code"], {})
+    m = db_get_mission(event["mission_code"])
     sd, ed = event["start_date"], event["end_date"]
     multi  = sd != ed
     dstr   = (f"{sd.strftime('%a %d %b')} — {ed.strftime('%a %d %b %Y')}"
@@ -242,7 +242,7 @@ def build_event_announcement_embed(event: dict) -> discord.Embed:
 
 def build_briefing_embed(event: dict, round_number: int, day_number: int,
                           players: List[dict]) -> discord.Embed:
-    m = TOURNAMENT_MISSIONS.get(event["mission_code"], {})
+    m = db_get_mission(event["mission_code"])
     roster = "\n".join(
         f"{fe(p['army'])}  **{p['player_username']}**  ·  *{p['army']}*"
         for p in players
