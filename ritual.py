@@ -759,7 +759,6 @@ async def run_layout_mission_phase(bot, guild: discord.Guild, tr_id: str, slots:
             await _post_ritual_update(thread,
                 f"🎯 **Slot {slot}{layout_str}: {mission_team_name}** choosing mission...")
 
-        action_msg = None
             action_msg = await thread.send(
                 f"🎯 **Slot {slot}{layout_str}: {mission_team_name} — select a Mission.**",
                 view=SingleCaptainActionView(
