@@ -5,8 +5,6 @@ Slash commands for event lifecycle management (TO only).
 
 Commands (all under /event group):
   • /event create
-  • /event set-layouts
-  • /event set-missions
   • /event open-interest
   • /event open-registration
   • /event lock-lists
@@ -33,7 +31,7 @@ from config import (GUILD_ID, GUILD, EVENT_NOTICEBOARD_ID, WHATS_PLAYING_ID,
 from state import ES, RS, FMT, is_to, get_thread_reg
 from database import *
 from threads import (ensure_submissions_thread, ensure_lists_thread,
-                     add_player_to_event_threads, calculate_rounds,
+                     add_player_to_event_threads, event_round_count,
                      ensure_all_round_threads)
 from embeds import (build_event_announcement_embed, build_list_review_header,
                     build_player_list_embed, build_spectator_dashboard_embed,
@@ -67,25 +65,33 @@ event_grp = app_commands.Group(
 @event_grp.command(name="create", description="Create a new TTS tournament event")
 @app_commands.describe(
     name="Event name",
-    mission="Mission code",
+    mission="Default mission code (used as fallback; singles/2v2 must also set pairings)",
     points_limit="Points limit (e.g. 2000)",
-    max_players="Maximum number of players",
+    max_players="Maximum number of players (or teams for team formats)",
     start_date="Start date (YYYY-MM-DD)",
     end_date="End date (YYYY-MM-DD)",
+    round_count="Number of rounds: 3 (up to 8 players/teams) or 5 (up to 32)",
     rounds_per_day="Rounds per day",
     terrain_layout="Optional terrain layout notes",
     format="Event format",
-    layouts="Team events: comma-separated layout numbers for this event, max 3 (e.g. 1,4,8)",
-    missions="Team events: comma-separated mission codes for this event, max 3 (e.g. A,C,M)",
+    pairings="Singles/2v2: comma-separated Layout:MissionCode pairs for every round e.g. 1:A,4:C,8:M",
+    layouts="Team formats: comma-separated layout numbers for ritual pool, max 3 (e.g. 1,4,8)",
+    missions="Team formats: comma-separated mission codes for ritual pool, max 3 (e.g. A,C,M)",
 )
 @app_commands.autocomplete(mission=ac_missions)
-@app_commands.choices(format=[
-    app_commands.Choice(name="Singles",   value="singles"),
-    app_commands.Choice(name="2v2",       value="2v2"),
-    app_commands.Choice(name="Teams 3s",  value="teams_3"),
-    app_commands.Choice(name="Teams 5s",  value="teams_5"),
-    app_commands.Choice(name="Teams 8s",  value="teams_8"),
-])
+@app_commands.choices(
+    format=[
+        app_commands.Choice(name="Singles",   value="singles"),
+        app_commands.Choice(name="2v2",       value="2v2"),
+        app_commands.Choice(name="Teams 3s",  value="teams_3"),
+        app_commands.Choice(name="Teams 5s",  value="teams_5"),
+        app_commands.Choice(name="Teams 8s",  value="teams_8"),
+    ],
+    round_count=[
+        app_commands.Choice(name="3 rounds (≤8 players/teams)",  value=3),
+        app_commands.Choice(name="5 rounds (≤32 players/teams)", value=5),
+    ],
+)
 async def event_create(
     interaction: discord.Interaction,
     name: str,
@@ -94,9 +100,11 @@ async def event_create(
     max_players: int,
     start_date: str,
     end_date: str,
+    round_count: int = 3,
     rounds_per_day: int = 3,
     terrain_layout: str = "",
     format: str = "singles",
+    pairings: str = "",
     layouts: str = "",
     missions: str = "",
 ):
@@ -114,27 +122,93 @@ async def event_create(
     if not mission_obj:
         await interaction.followup.send("❌ Invalid mission code.", ephemeral=True); return
 
-    # Parse and validate event layouts and missions (team formats only)
-    event_layouts  = [l.strip() for l in layouts.split(",")  if l.strip()][:3]
-    event_missions = [m.strip() for m in missions.split(",") if m.strip()][:3]
-
-    for code in event_missions:
-        if not db_get_mission(code):
-            await interaction.followup.send(
-                f"❌ Unknown mission code: `{code}`. Check `/mission list`.", ephemeral=True)
-            return
+    # ── Validate round count ──────────────────────────────────────────────
+    if round_count not in (3, 5):
+        await interaction.followup.send("❌ round_count must be 3 or 5.", ephemeral=True); return
 
     team_sz  = FMT.team_size(format)
     ind_pts  = FMT.individual_points(format)
 
+    # ── Format-specific mission/layout validation ─────────────────────────
+    event_pairings  = []
+    event_layouts   = []
+    event_missions  = []
+
+    if format in ("singles", "2v2"):
+        # Require explicit pairings: one per round, e.g. "1:A,4:C,8:M"
+        if not pairings.strip():
+            await interaction.followup.send(
+                f"❌ Singles/2v2 events require `pairings` — one Layout:Mission pair per round.\n"
+                f"Example for {round_count} rounds: `1:A,4:C,8:M`" + (",6:B,4:D" if round_count == 5 else ""),
+                ephemeral=True,
+            ); return
+
+        raw_pairs = [p.strip() for p in pairings.split(",") if p.strip()]
+        if len(raw_pairs) != round_count:
+            await interaction.followup.send(
+                f"❌ Expected exactly {round_count} Layout:Mission pairs (one per round), "
+                f"got {len(raw_pairs)}.",
+                ephemeral=True,
+            ); return
+
+        all_missions = db_get_missions()
+        seen = set()
+        for raw in raw_pairs:
+            parts = raw.split(":")
+            if len(parts) != 2:
+                await interaction.followup.send(
+                    f"❌ Bad pair format `{raw}` — use Layout:MissionCode, e.g. `1:A`.",
+                    ephemeral=True,
+                ); return
+            layout_num, mission_code = parts[0].strip(), parts[1].strip().upper()
+
+            # Check mission exists
+            m_obj = all_missions.get(mission_code)
+            if not m_obj:
+                await interaction.followup.send(
+                    f"❌ Unknown mission code `{mission_code}`. Check `/mission list`.",
+                    ephemeral=True,
+                ); return
+
+            # Check layout is valid for this mission
+            if layout_num not in m_obj["layouts"]:
+                await interaction.followup.send(
+                    f"❌ Layout **{layout_num}** is not valid for mission **{mission_code}** "
+                    f"({m_obj['name']}). Valid layouts: {', '.join(m_obj['layouts'])}.",
+                    ephemeral=True,
+                ); return
+
+            # Check for duplicate combinations
+            combo_key = (layout_num, mission_code)
+            if combo_key in seen:
+                await interaction.followup.send(
+                    f"❌ Duplicate pairing: Layout {layout_num} + Mission {mission_code} "
+                    f"appears more than once.",
+                    ephemeral=True,
+                ); return
+            seen.add(combo_key)
+            event_pairings.append({"layout": layout_num, "mission": mission_code})
+
+    else:
+        # Team formats: optional pools, warn if not set
+        event_layouts  = [l.strip() for l in layouts.split(",")  if l.strip()][:3]
+        event_missions = [m.strip() for m in missions.split(",") if m.strip()][:3]
+        for code in event_missions:
+            if not db_get_mission(code):
+                await interaction.followup.send(
+                    f"❌ Unknown mission code `{code}`. Check `/mission list`.",
+                    ephemeral=True,
+                ); return
+
     eid = db_create_event({
         "name": name, "mission_code": mission, "points_limit": points_limit,
         "start_date": sd, "end_date": ed, "max_players": max_players,
-        "rounds_per_day": rounds_per_day, "terrain_layout": terrain_layout,
-        "created_by": str(interaction.user.id),
+        "round_count": round_count, "rounds_per_day": rounds_per_day,
+        "terrain_layout": terrain_layout, "created_by": str(interaction.user.id),
     })
     db_update_event(eid, {
         "format": format, "team_size": team_sz, "individual_points": ind_pts,
+        "event_pairings": event_pairings,
         "event_layouts": event_layouts, "event_missions": event_missions,
     })
 
@@ -179,18 +253,18 @@ async def event_create(
         "teams_3": "Teams 3s", "teams_5": "Teams 5s", "teams_8": "Teams 8s",
     }.get(format, "Singles")
 
-    # Build confirmation message, noting layout/mission config for team events
+    # Confirmation summary
     confirm = (
         f"✅ **{name}** created — `{eid}`\n"
-        f"Format: **{fmt_label}** · {ind_pts}pts per player\n"
-        f"{calculate_rounds(max_players)} rounds suggested  ·  Announcement posted to #event-noticeboard"
+        f"Format: **{fmt_label}** · {ind_pts}pts per player · **{round_count} rounds** · {rounds_per_day}/day\n"
     )
-    if format in ("teams_3", "teams_5", "teams_8"):
-        layout_str  = ", ".join(f"Layout {l}" for l in event_layouts) if event_layouts else "⚠️ none set"
-        mission_str = ", ".join(event_missions) if event_missions else "⚠️ none set"
-        confirm += f"\n🗺️ Layouts: {layout_str}\n🎯 Missions: {mission_str}"
-        if not event_layouts or not event_missions:
-            confirm += "\n\n⚠️ Use `/event set-layouts` and `/event set-missions` before running the ritual."
+    if format in ("singles", "2v2"):
+        pair_lines = [f"  R{i+1}: Layout {p['layout']} + Mission {p['mission']}" for i, p in enumerate(event_pairings)]
+        confirm += "Round pairings:\n" + "\n".join(pair_lines)
+    else:
+        layout_str  = ", ".join(f"Layout {l}" for l in event_layouts)  if event_layouts  else "⚠️ none (set with /event set-layouts)"
+        mission_str = ", ".join(event_missions)                          if event_missions else "⚠️ none (set with /event set-missions)"
+        confirm += f"Layout pool: {layout_str}\nMission pool: {mission_str}"
 
     await interaction.followup.send(confirm, ephemeral=True)
     mission_name = mission_obj["name"]
@@ -198,62 +272,9 @@ async def event_create(
         interaction.client,
         "Event Created",
         f"🏆 **{name}** by {interaction.user.display_name}\n"
-        f"Format: {fmt_label} · Mission {mission}: {mission_name} · {ind_pts}pts · {sd}→{ed}",
+        f"Format: {fmt_label} · {ind_pts}pts · {round_count} rounds · {sd}→{ed}",
         COLOUR_GOLD,
     )
-
-
-@event_grp.command(name="set-layouts", description="[TO] Set the terrain layouts for a team event (max 3)")
-@app_commands.describe(
-    event_id="The event",
-    layouts="Comma-separated layout numbers, max 3 (e.g. 1,4,8). TO must verify all layout+mission combos are valid beforehand.",
-)
-@app_commands.autocomplete(event_id=ac_active_events)
-async def event_set_layouts(interaction: discord.Interaction, event_id: str, layouts: str):
-    if not is_to(interaction):
-        await interaction.response.send_message("❌ TO only.", ephemeral=True); return
-    event = db_get_event(event_id)
-    if not event:
-        await interaction.response.send_message("❌ Event not found.", ephemeral=True); return
-    parsed = [l.strip() for l in layouts.split(",") if l.strip()][:3]
-    if not parsed:
-        await interaction.response.send_message("❌ Provide at least one layout number.", ephemeral=True); return
-    db_update_event(event_id, {"event_layouts": parsed})
-    await interaction.response.send_message(
-        f"✅ Layouts for **{event['name']}** set to: {', '.join(f'Layout {l}' for l in parsed)}",
-        ephemeral=True,
-    )
-
-
-@event_grp.command(name="set-missions", description="[TO] Set the missions for a team event (max 3)")
-@app_commands.describe(
-    event_id="The event",
-    missions="Comma-separated mission codes, max 3 (e.g. A,C,M). TO must verify all layout+mission combos are valid beforehand.",
-)
-@app_commands.autocomplete(event_id=ac_active_events)
-async def event_set_missions(interaction: discord.Interaction, event_id: str, missions: str):
-    if not is_to(interaction):
-        await interaction.response.send_message("❌ TO only.", ephemeral=True); return
-    event = db_get_event(event_id)
-    if not event:
-        await interaction.response.send_message("❌ Event not found.", ephemeral=True); return
-    parsed = [m.strip() for m in missions.split(",") if m.strip()][:3]
-    if not parsed:
-        await interaction.response.send_message("❌ Provide at least one mission code.", ephemeral=True); return
-    for code in parsed:
-        if not db_get_mission(code):
-            await interaction.response.send_message(
-                f"❌ Unknown mission code: `{code}`. Check `/mission list`.", ephemeral=True)
-            return
-    db_update_event(event_id, {"event_missions": parsed})
-    mission_names = ", ".join(
-        f"`{code}` ({db_get_mission(code).get('name', '?')})" for code in parsed
-    )
-    await interaction.response.send_message(
-        f"✅ Missions for **{event['name']}** set to: {mission_names}",
-        ephemeral=True,
-    )
-
 
 @event_grp.command(name="open-interest", description="Open interest registration")
 @app_commands.autocomplete(event_id=ac_active_events)
@@ -351,7 +372,7 @@ async def event_start(interaction: discord.Interaction, event_id: str):
 
     nb_ch = interaction.guild.get_channel(EVENT_NOTICEBOARD_ID)
     regs  = db_get_registrations(event_id, RS.APPROVED)
-    total_rounds = calculate_rounds(event["max_players"])
+    total_rounds = event_round_count(event)
 
     pinned_msgs = []
 
