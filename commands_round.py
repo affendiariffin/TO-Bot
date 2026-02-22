@@ -30,7 +30,7 @@ from config import (GUILD, GUILD_ID, EVENT_NOTICEBOARD_ID, ANNOUNCEMENTS_ID,
 from state import ES, RndS, GS, RS, is_to, get_thread_reg
 from database import *
 from threads import (ensure_round_thread, swiss_pair, assign_rooms,
-                     get_previous_pairings, calculate_rounds, get_avg_vp,
+                     get_previous_pairings, event_round_count, get_avg_vp,
                      archive_event_threads)
 from embeds import (build_briefing_embed, build_pairings_embed,
                     build_standings_embed, build_spectator_dashboard_embed,
@@ -82,7 +82,7 @@ async def round_start(interaction: discord.Interaction, event_id: str, duration_
 
     existing   = db_get_rounds(event_id)
     round_num  = len(existing) + 1
-    max_rounds = calculate_rounds(event["max_players"])
+    max_rounds = event_round_count(event)
     if round_num > max_rounds:
         await interaction.followup.send(
             f"❌ All {max_rounds} rounds complete. Use `/event-finish` to close.", ephemeral=True); return
