@@ -22,7 +22,7 @@ import random as _random
 from datetime import datetime
 from typing import List, Optional
 from config import (GUILD, GUILD_ID, COLOUR_GOLD, COLOUR_AMBER, COLOUR_SLATE,
-                    TOURNAMENT_MISSIONS, fe)
+                    fe)
 from state import PS, TRS, FMT, is_to
 from database import *
 from services import ac_active_events
@@ -291,12 +291,13 @@ class SelectMissionView(ui.View):
         self.tr_id      = tr_id
         self.captain_id = captain_id
         self.slot       = slot
-        valid = [(code, m) for code, m in TOURNAMENT_MISSIONS.items()
+        _missions = db_get_missions()
+        valid = [(code, m) for code, m in _missions.items()
                  if str(layout) in m.get("layouts", [])]
         options = [
             discord.SelectOption(label=f"{code}: {m['name']}", value=code,
                                   description=m["deployment"][:50])
-            for code, m in (valid or list(TOURNAMENT_MISSIONS.items()))[:25]
+            for code, m in (valid or list(_missions.items()))[:25]
         ]
         sel = ui.Select(placeholder=f"Choose mission for Slot {slot}...",
                          options=options, min_values=1, max_values=1)
