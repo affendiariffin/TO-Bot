@@ -294,6 +294,59 @@ def init_db():
                 )
             """)
 
+            # ── Missions & layouts ───────────────────────────────────────────
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS tournament_missions (
+                    code         TEXT PRIMARY KEY,
+                    name         TEXT NOT NULL,
+                    deployment   TEXT NOT NULL
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS tournament_layouts (
+                    id           SERIAL PRIMARY KEY,
+                    mission_code TEXT NOT NULL REFERENCES tournament_missions(code) ON DELETE CASCADE,
+                    layout       TEXT NOT NULL,
+                    UNIQUE (mission_code, layout)
+                )
+            """)
+
+            # Seed default missions (idempotent — skips existing rows)
+            _MISSION_SEED = [
+                ("A", "Take and Hold",   "Tipping Point",       ["1","2","4","6","7","8"]),
+                ("B", "Supply Drop",     "Tipping Point",       ["1","2","4","6","7","8"]),
+                ("C", "Linchpin",        "Tipping Point",       ["1","2","4","6","7","8"]),
+                ("D", "Scorched Earth",  "Tipping Point",       ["1","2","4","6","7","8"]),
+                ("E", "Take and Hold",   "Hammer and Anvil",    ["1","7","8"]),
+                ("F", "Hidden Supplies", "Hammer and Anvil",    ["1","7","8"]),
+                ("G", "Purge the Foe",   "Hammer and Anvil",    ["1","7","8"]),
+                ("H", "Supply Drop",     "Hammer and Anvil",    ["1","7","8"]),
+                ("I", "Hidden Supplies", "Search and Destroy",  ["1","2","3","4","6"]),
+                ("J", "Linchpin",        "Search and Destroy",  ["1","2","3","4","6"]),
+                ("K", "Scorched Earth",  "Search and Destroy",  ["1","2","3","4","6"]),
+                ("L", "Take and Hold",   "Search and Destroy",  ["1","2","3","4","6"]),
+                ("M", "Purge the Foe",   "Crucible of Battle",  ["1","2","4","6","8"]),
+                ("N", "Hidden Supplies", "Crucible of Battle",  ["1","2","4","6","8"]),
+                ("O", "Terraform",       "Crucible of Battle",  ["1","2","4","6","8"]),
+                ("P", "Scorched Earth",  "Crucible of Battle",  ["1","2","4","6","8"]),
+                ("Q", "Supply Drop",     "Sweeping Engagement", ["3","5"]),
+                ("R", "Terraform",       "Sweeping Engagement", ["3","5"]),
+                ("S", "Linchpin",        "Dawn of War",         ["5"]),
+                ("T", "Purge the Foe",   "Dawn of War",         ["5"]),
+            ]
+            for code, name, deployment, layouts in _MISSION_SEED:
+                cur.execute("""
+                    INSERT INTO tournament_missions (code, name, deployment)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (code) DO NOTHING
+                """, (code, name, deployment))
+                for layout in layouts:
+                    cur.execute("""
+                        INSERT INTO tournament_layouts (mission_code, layout)
+                        VALUES (%s, %s)
+                        ON CONFLICT (mission_code, layout) DO NOTHING
+                    """, (code, layout))
+
             conn.commit()
     print("✅ Tournament DB ready")  # FIX: corrected indentation (was 2 spaces, causing IndentationError)
 
@@ -1029,3 +1082,65 @@ def db_get_factions() -> dict[str, dict]:
 def db_get_army_names() -> list[str]:
     """Return sorted list of army names. Replaces WARHAMMER_ARMIES."""
     return list(_factions_cache.keys())   # already sorted by sort_order from query
+
+
+# ── Missions & Layouts ────────────────────────────────────────────────────────
+
+def db_get_missions() -> dict:
+    """
+    Return all missions as a dict keyed by code:
+      { "A": {"name": "Take and Hold", "deployment": "Tipping Point", "layouts": ["1","2",...]}, ... }
+    Replaces the static TOURNAMENT_MISSIONS dict in config.py.
+    """
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT code, name, deployment FROM tournament_missions ORDER BY code")
+            missions = {r["code"]: {"name": r["name"], "deployment": r["deployment"], "layouts": []}
+                        for r in cur.fetchall()}
+            cur.execute("SELECT mission_code, layout FROM tournament_layouts ORDER BY mission_code, layout")
+            for r in cur.fetchall():
+                if r["mission_code"] in missions:
+                    missions[r["mission_code"]]["layouts"].append(r["layout"])
+    return missions
+
+
+def db_get_mission(code: str) -> dict:
+    """
+    Return a single mission dict {"name", "deployment", "layouts"} for the given code,
+    or {} if not found.
+    """
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT code, name, deployment FROM tournament_missions WHERE code = %s", (code,))
+            row = cur.fetchone()
+            if not row:
+                return {}
+            cur.execute("SELECT layout FROM tournament_layouts WHERE mission_code = %s ORDER BY layout", (code,))
+            layouts = [r["layout"] for r in cur.fetchall()]
+    return {"name": row["name"], "deployment": row["deployment"], "layouts": layouts}
+
+
+def db_upsert_mission(code: str, name: str, deployment: str, layouts: list) -> None:
+    """Insert or replace a mission and its layouts."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO tournament_missions (code, name, deployment)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (code) DO UPDATE SET name = EXCLUDED.name, deployment = EXCLUDED.deployment
+            """, (code, name, deployment))
+            cur.execute("DELETE FROM tournament_layouts WHERE mission_code = %s", (code,))
+            for layout in layouts:
+                cur.execute("""
+                    INSERT INTO tournament_layouts (mission_code, layout) VALUES (%s, %s)
+                    ON CONFLICT (mission_code, layout) DO NOTHING
+                """, (code, layout))
+            conn.commit()
+
+
+def db_delete_mission(code: str) -> None:
+    """Delete a mission and all its layouts (cascade)."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM tournament_missions WHERE code = %s", (code,))
+            conn.commit()
