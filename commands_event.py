@@ -445,9 +445,9 @@ class ListSubmissionModal(discord.ui.Modal, title="Submit Army List"):
         db_upsert_registration(
             self.event_id, str(interaction.user.id),
             interaction.user.display_name, RS.PENDING,
-            army=self.army, detachment=self.detachment,
+            army=self.army, det=self.detachment,
             list_text=self.list_text.value,
-        )
+          )
 
         # Post to submissions thread for TO review
         sub_thread = await ensure_submissions_thread(
