@@ -212,8 +212,13 @@ def init_db():
                 # team formats: pool of layouts/missions captains pick from during each ritual
                 "event_layouts TEXT",
                 "event_missions TEXT",
+                "rules_cutoff TEXT",
+                "reg_deadline TEXT",
             ):
                 cur.execute(f"ALTER TABLE tournament_events ADD COLUMN IF NOT EXISTS {col_def}")
+            cur.execute(
+                "ALTER TABLE tournament_registrations ADD COLUMN IF NOT EXISTS chop_thread_id TEXT"
+            )
 
             for col_def in (
                 "team_id TEXT",
