@@ -79,8 +79,6 @@ class ChopRegistrationView(ui.View):
     @ui.button(label="✊  Chop", style=discord.ButtonStyle.success,
                custom_id="chop_reg_chop", emoji="✊", row=0)
     async def btn_chop(self, interaction: discord.Interaction, button: ui.Button):
-        # Build the actual custom_id dynamically — Discord requires persistent custom_ids.
-        # We use a modal to capture the list, then create the private thread.
         event = db_get_event(self.event_id)
         if not event:
             await interaction.response.send_message("❌ Event not found.", ephemeral=True)
@@ -94,7 +92,8 @@ class ChopRegistrationView(ui.View):
         existing = db_get_registration(self.event_id, str(interaction.user.id))
         if existing and existing["state"] in (RS.PENDING, RS.APPROVED):
             await interaction.response.send_message(
-                f"ℹ️ You're already registered as **{'Chop' if existing['state'] == RS.PENDING else 'Confirmed'}**.",
+                f"ℹ️ You're already registered as **{'Chop' if existing['state'] == RS.PENDING else 'Confirmed'}**.\n"
+                f"To update your list, use the **Reserve** button to resubmit, or contact the TO.",
                 ephemeral=True)
             return
         if existing and existing["state"] == RS.REJECTED:
@@ -102,14 +101,14 @@ class ChopRegistrationView(ui.View):
                 "❌ Your registration was rejected. Contact the TO.", ephemeral=True)
             return
 
-        # Check if event is full (confirmed slots only count confirmed)
+        # Check if the Chop slots are full (Confirmed + Chop >= max_players)
         confirmed_count = len(db_get_registrations(self.event_id, RS.APPROVED))
         chop_count      = len(db_get_registrations(self.event_id, RS.PENDING))
         if confirmed_count + chop_count >= event["max_players"]:
-            # Still allow as Reserve
-            await interaction.response.send_modal(
-                ChopListSubmissionModal(self.event_id, as_reserve=True)
-            )
+            await interaction.response.send_message(
+                f"ℹ️ The Chop slots are full ({confirmed_count + chop_count}/{event['max_players']}).\n"
+                f"Click **Reserve 🖐️** to join the waitlist instead.",
+                ephemeral=True)
             return
 
         await interaction.response.send_modal(
@@ -129,12 +128,17 @@ class ChopRegistrationView(ui.View):
             return
 
         existing = db_get_registration(self.event_id, str(interaction.user.id))
-        if existing and existing["state"] in (RS.PENDING, RS.APPROVED, RS.INTERESTED):
+        if existing and existing["state"] in (RS.PENDING, RS.APPROVED):
             await interaction.response.send_message(
-                f"ℹ️ You're already registered as **"
-                f"{'Confirmed' if existing['state'] == RS.APPROVED else ('Chop' if existing['state'] == RS.PENDING else 'Reserve')}**.",
+                f"ℹ️ You're already registered as **{'Chop' if existing['state'] == RS.PENDING else 'Confirmed'}**. "
+                "Contact the TO if you need to update your list.",
                 ephemeral=True)
             return
+        if existing and existing["state"] == RS.REJECTED:
+            await interaction.response.send_message(
+                "❌ Your registration was rejected. Contact the TO.", ephemeral=True)
+            return
+        # INTERESTED (Reserve) falls through — can re-open modal to update their list
 
         await interaction.response.send_modal(
             ChopListSubmissionModal(self.event_id, as_reserve=True)
@@ -149,9 +153,7 @@ class ChopRegistrationView(ui.View):
                 "❌ You're not currently registered for this event.", ephemeral=True)
             return
 
-        # Delegate to the /reg drop logic via a quick inline withdrawal
-        # Import here to avoid circular
-        from commands_event import refresh_event_card, reg_drop  # noqa — not calling slash cmd
+        from commands_event import refresh_event_card
         event = db_get_event(self.event_id)
         was_confirmed = reg["state"] == RS.APPROVED
         was_chop      = reg["state"] == RS.PENDING
@@ -253,6 +255,10 @@ class ChopListSubmissionModal(ui.Modal, title="Submit Your Army List"):
 
         new_state = RS.INTERESTED if self.as_reserve else RS.PENDING
 
+        # Check if re-submitting before upsert (determines "Updated" vs "Submitted" label)
+        existing = db_get_registration(self.event_id, str(interaction.user.id))
+        is_update = existing is not None
+
         db_upsert_registration(
             self.event_id, str(interaction.user.id),
             interaction.user.display_name, new_state,
@@ -275,7 +281,7 @@ class ChopListSubmissionModal(ui.Modal, title="Submit Your Army List"):
 
         if thread:
             embed = discord.Embed(
-                title=f"📋  List {'Updated' if db_get_registration(self.event_id, str(interaction.user.id)) else 'Submitted'}  —  {interaction.user.display_name}",
+                title=f"📋  List {'Updated' if is_update else 'Submitted'}  —  {interaction.user.display_name}",
                 description=(
                     f"**Status:** {status_label}\n"
                     f"⚔️ **{self.army.value.strip()}** · *{self.detachment.value.strip()}*\n\n"
