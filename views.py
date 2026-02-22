@@ -61,6 +61,246 @@ async def log_immediate(bot, title, description, colour=None):
 # VIEWS & BUTTONS
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════════════════════════
+# SINGLES REGISTRATION VIEW  —  Chop / Reserve / Withdraw
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ChopRegistrationView(ui.View):
+    """
+    Persistent view on the singles event card.
+    Row 0: Chop ✊ | Reserve 🖐️ | Withdraw 🚪
+    Players click Chop to register interest + submit their list.
+    A private thread is created for list review between the player, bot, and TO.
+    """
+    def __init__(self, event_id: str):
+        super().__init__(timeout=None)
+        self.event_id = event_id
+
+    @ui.button(label="✊  Chop", style=discord.ButtonStyle.success,
+               custom_id="chop_reg_chop", emoji="✊", row=0)
+    async def btn_chop(self, interaction: discord.Interaction, button: ui.Button):
+        # Build the actual custom_id dynamically — Discord requires persistent custom_ids.
+        # We use a modal to capture the list, then create the private thread.
+        event = db_get_event(self.event_id)
+        if not event:
+            await interaction.response.send_message("❌ Event not found.", ephemeral=True)
+            return
+        if event["state"] not in (ES.ANNOUNCED, ES.INTEREST, ES.REGISTRATION):
+            await interaction.response.send_message(
+                "❌ Registration is not currently open.", ephemeral=True)
+            return
+
+        # Check if already registered
+        existing = db_get_registration(self.event_id, str(interaction.user.id))
+        if existing and existing["state"] in (RS.PENDING, RS.APPROVED):
+            await interaction.response.send_message(
+                f"ℹ️ You're already registered as **{'Chop' if existing['state'] == RS.PENDING else 'Confirmed'}**.",
+                ephemeral=True)
+            return
+        if existing and existing["state"] == RS.REJECTED:
+            await interaction.response.send_message(
+                "❌ Your registration was rejected. Contact the TO.", ephemeral=True)
+            return
+
+        # Check if event is full (confirmed slots only count confirmed)
+        confirmed_count = len(db_get_registrations(self.event_id, RS.APPROVED))
+        chop_count      = len(db_get_registrations(self.event_id, RS.PENDING))
+        if confirmed_count + chop_count >= event["max_players"]:
+            # Still allow as Reserve
+            await interaction.response.send_modal(
+                ChopListSubmissionModal(self.event_id, as_reserve=True)
+            )
+            return
+
+        await interaction.response.send_modal(
+            ChopListSubmissionModal(self.event_id, as_reserve=False)
+        )
+
+    @ui.button(label="🖐️  Reserve", style=discord.ButtonStyle.primary,
+               custom_id="chop_reg_reserve", emoji="🖐️", row=0)
+    async def btn_reserve(self, interaction: discord.Interaction, button: ui.Button):
+        event = db_get_event(self.event_id)
+        if not event:
+            await interaction.response.send_message("❌ Event not found.", ephemeral=True)
+            return
+        if event["state"] not in (ES.ANNOUNCED, ES.INTEREST, ES.REGISTRATION):
+            await interaction.response.send_message(
+                "❌ Registration is not currently open.", ephemeral=True)
+            return
+
+        existing = db_get_registration(self.event_id, str(interaction.user.id))
+        if existing and existing["state"] in (RS.PENDING, RS.APPROVED, RS.INTERESTED):
+            await interaction.response.send_message(
+                f"ℹ️ You're already registered as **"
+                f"{'Confirmed' if existing['state'] == RS.APPROVED else ('Chop' if existing['state'] == RS.PENDING else 'Reserve')}**.",
+                ephemeral=True)
+            return
+
+        await interaction.response.send_modal(
+            ChopListSubmissionModal(self.event_id, as_reserve=True)
+        )
+
+    @ui.button(label="🚪  Withdraw", style=discord.ButtonStyle.secondary,
+               custom_id="chop_reg_withdraw", emoji="🚪", row=0)
+    async def btn_withdraw(self, interaction: discord.Interaction, button: ui.Button):
+        reg = db_get_registration(self.event_id, str(interaction.user.id))
+        if not reg or reg["state"] in (RS.DROPPED, RS.REJECTED):
+            await interaction.response.send_message(
+                "❌ You're not currently registered for this event.", ephemeral=True)
+            return
+
+        # Delegate to the /reg drop logic via a quick inline withdrawal
+        # Import here to avoid circular
+        from commands_event import refresh_event_card, reg_drop  # noqa — not calling slash cmd
+        event = db_get_event(self.event_id)
+        was_confirmed = reg["state"] == RS.APPROVED
+        was_chop      = reg["state"] == RS.PENDING
+
+        db_update_registration(self.event_id, str(interaction.user.id), {
+            "state":      RS.DROPPED,
+            "dropped_at": datetime.utcnow(),
+        })
+        if was_confirmed:
+            db_update_standing(self.event_id, str(interaction.user.id), {"active": False})
+
+        # Close private thread
+        tid = reg.get("chop_thread_id")
+        if tid:
+            t = interaction.guild.get_thread(int(tid))
+            if t:
+                try:
+                    await t.send("👋 Player has withdrawn. This thread is now closed.")
+                    await t.edit(archived=True, locked=True)
+                except Exception:
+                    pass
+
+        # Promote oldest Reserve if Chop/Confirmed withdrew
+        if was_chop or was_confirmed:
+            all_regs = db_get_registrations(self.event_id)
+            reserves = sorted(
+                [r for r in all_regs if r["state"] == RS.INTERESTED
+                 and r["player_id"] != str(interaction.user.id)],
+                key=lambda r: r.get("submitted_at") or datetime.min,
+            )
+            if reserves:
+                promoted = reserves[0]
+                db_update_registration(self.event_id, promoted["player_id"], {"state": RS.PENDING})
+                try:
+                    pu = await interaction.client.fetch_user(int(promoted["player_id"]))
+                    await pu.send(
+                        f"🎉 **Promoted from Reserve to Chop for {event['name']}!**\n"
+                        f"Check your private thread — the TO will review your list shortly."
+                    )
+                except Exception:
+                    pass
+                p_tid = promoted.get("chop_thread_id")
+                if p_tid:
+                    pt = interaction.guild.get_thread(int(p_tid))
+                    if pt:
+                        try:
+                            await pt.send(
+                                f"🎉 **You've been promoted from Reserve → Chop!**\n"
+                                f"A Chop spot opened up. The TO will review and confirm shortly."
+                            )
+                        except Exception:
+                            pass
+
+        await refresh_event_card(interaction.client, self.event_id, interaction.guild)
+
+        # Withdrawal flavour text (adapted from LFG bot)
+        uid = interaction.user.id
+        _withdraw_count[uid] = _withdraw_count.get(uid, 0) + 1
+        if _withdraw_count[uid] == 1:
+            try:
+                await interaction.user.send("What, lah! Don't leave a bro hanging la bro. 😤")
+            except Exception:
+                pass
+
+        await interaction.response.send_message("✅ You've withdrawn from this event.", ephemeral=True)
+
+
+# Simple in-memory withdrawal counter (mirrors LFG bot pattern)
+_withdraw_count: dict[int, int] = {}
+
+
+class ChopListSubmissionModal(ui.Modal, title="Submit Your Army List"):
+    """
+    Modal opened when a player clicks Chop or Reserve.
+    Captures army name, detachment, and list text.
+    On submit: creates/updates registration and creates private thread.
+    """
+    army       = ui.TextInput(label="Army / Faction",      placeholder="e.g. Space Marines",       max_length=80)
+    detachment = ui.TextInput(label="Detachment",          placeholder="e.g. Gladius Task Force",  max_length=80)
+    list_text  = ui.TextInput(
+        label="Army List",
+        style=discord.TextStyle.paragraph,
+        placeholder="Paste your full list here (from New Recruit / BattleScribe / Wahapedia)…",
+        max_length=3900,
+    )
+
+    def __init__(self, event_id: str, as_reserve: bool = False):
+        super().__init__()
+        self.event_id   = event_id
+        self.as_reserve = as_reserve
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        event = db_get_event(self.event_id)
+        if not event:
+            await interaction.followup.send("❌ Event not found.", ephemeral=True)
+            return
+
+        new_state = RS.INTERESTED if self.as_reserve else RS.PENDING
+
+        db_upsert_registration(
+            self.event_id, str(interaction.user.id),
+            interaction.user.display_name, new_state,
+            army=self.army.value.strip(),
+            det=self.detachment.value.strip(),
+            list_text=self.list_text.value,
+        )
+
+        # Get or create private thread for this player
+        from commands_event import get_or_create_chop_thread, refresh_event_card
+        thread = await get_or_create_chop_thread(
+            interaction.client,
+            self.event_id,
+            str(interaction.user.id),
+            interaction.user.display_name,
+            interaction.guild,
+        )
+
+        status_label = "Reserve" if self.as_reserve else "Chop"
+
+        if thread:
+            embed = discord.Embed(
+                title=f"📋  List {'Updated' if db_get_registration(self.event_id, str(interaction.user.id)) else 'Submitted'}  —  {interaction.user.display_name}",
+                description=(
+                    f"**Status:** {status_label}\n"
+                    f"⚔️ **{self.army.value.strip()}** · *{self.detachment.value.strip()}*\n\n"
+                    f"```\n{self.list_text.value[:1800]}\n```"
+                    + ("\n*[truncated]*" if len(self.list_text.value) > 1800 else "")
+                ),
+                color=COLOUR_AMBER,
+            )
+            embed.set_footer(text="TO: use /reg approve / relegate / reject")
+            await thread.send(
+                content=f"📬 New list submission from <@{interaction.user.id}> — **{status_label}**",
+                embed=embed,
+            )
+
+        await refresh_event_card(interaction.client, self.event_id, interaction.guild)
+
+        await interaction.followup.send(
+            f"✅ List submitted for **{event['name']}**!\n"
+            f"Status: **{status_label}**\n"
+            f"Army: **{self.army.value.strip()}** · *{self.detachment.value.strip()}*\n"
+            f"The TO will review your list in your private thread. Watch for a DM when confirmed.",
+            ephemeral=True,
+        )
+
+
 class EventAnnouncementView(ui.View):
     """Pinned on the event announcement card."""
     def __init__(self, event_id: str):
