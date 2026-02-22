@@ -18,8 +18,7 @@ import discord
 from discord import app_commands
 from datetime import datetime
 from typing import List
-from config import (WHATS_PLAYING_ID, EVENT_NOTICEBOARD_ID, BOT_LOGS_ID,
-                    TOURNAMENT_MISSIONS)
+from config import (WHATS_PLAYING_ID, EVENT_NOTICEBOARD_ID, BOT_LOGS_ID)
 # FIX: import live faction data from database cache instead of stale static config lists
 from database import *
 from state import get_thread_reg, GS, RS
@@ -131,9 +130,10 @@ async def ac_all_events(i: discord.Interaction, current: str):
             for e in db_get_all_events() if current.lower() in e["name"].lower()][:25]
 
 async def ac_missions(i: discord.Interaction, current: str):
+    missions = db_get_missions()
     return [
         app_commands.Choice(name=f"{code}: {m['name']} [{m['deployment']}]", value=code)
-        for code, m in TOURNAMENT_MISSIONS.items()
+        for code, m in missions.items()
         if current.lower() in f"{code} {m['name']} {m['deployment']}".lower()
     ][:25]
 
