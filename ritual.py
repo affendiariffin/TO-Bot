@@ -30,7 +30,7 @@ from config import (GUILD, GUILD_ID, COLOUR_GOLD, COLOUR_AMBER, COLOUR_SLATE, fe
 from state import PS, TRS, FMT, is_to
 from database import *
 from services import ac_active_events
-from commands_teams import ensure_pairing_room_thread
+# ensure_pairing_room_thread removed — each matchup now gets its own private thread
 from commands_round import round_grp
 
 
@@ -170,7 +170,7 @@ def build_pairing_dashboard_embed(
         PS.COMPLETE:        "✅ All pairings confirmed!",
     }
     embed.add_field(name="CURRENT STEP", value=step_labels.get(step, step), inline=False)
-    embed.set_footer(text=f"Phase {phase}/{phase_count}  ·  Captains receive prompts via DM")
+    embed.set_footer(text=f"Phase {phase}/{phase_count}  ·  Click the buttons below to make your secret selections")
     return embed
 
 
@@ -233,6 +233,72 @@ async def _wait_for_both(bot, tr_id: str, field_a: str, field_b: str,
 
 
 # ── Ritual interaction views ──────────────────────────────────────────────────
+
+class CaptainActionView(ui.View):
+    """
+    Posted once in the thread for each selection step.
+    Each captain clicks the button and receives their dropdown ephemerally —
+    visible only to them. Non-captains get a polite rejection.
+    Once both have submitted, the caller edits this message to ✅ and removes the view.
+    """
+    def __init__(self, tr_id: str, cap_a_id: str, cap_b_id: str,
+                 view_a: ui.View, view_b: ui.View, label: str,
+                 content_a: str = "Make your selection:",
+                 content_b: str = "Make your selection:"):
+        super().__init__(timeout=600)
+        self.tr_id      = tr_id
+        self.cap_a_id   = cap_a_id
+        self.cap_b_id   = cap_b_id
+        self.view_a     = view_a
+        self.view_b     = view_b
+        self.content_a  = content_a
+        self.content_b  = content_b
+        btn = ui.Button(label=label, style=discord.ButtonStyle.primary)
+        btn.callback = self._dispatch
+        self.add_item(btn)
+
+    async def _dispatch(self, interaction: discord.Interaction):
+        uid = str(interaction.user.id)
+        state = db_get_pairing_state(self.tr_id)
+        if uid == self.cap_a_id:
+            if state and state.get("defender_a") and state.get("attackers_a") and state.get("choice_a"):
+                await interaction.response.send_message("✅ You have already submitted.", ephemeral=True)
+                return
+            await interaction.response.send_message(self.content_a, view=self.view_a, ephemeral=True)
+        elif uid == self.cap_b_id:
+            if state and state.get("defender_b") and state.get("attackers_b") and state.get("choice_b"):
+                await interaction.response.send_message("✅ You have already submitted.", ephemeral=True)
+                return
+            await interaction.response.send_message(self.content_b, view=self.view_b, ephemeral=True)
+        else:
+            await interaction.response.send_message(
+                "❌ Only the two captains can interact here.", ephemeral=True)
+
+
+class SingleCaptainActionView(ui.View):
+    """
+    Like CaptainActionView but for steps where only ONE specific captain acts
+    (layout pick, mission pick). Other captain and spectators see a disabled button.
+    """
+    def __init__(self, tr_id: str, acting_cap_id: str, inner_view: ui.View,
+                 label: str, content: str = "Make your selection:"):
+        super().__init__(timeout=300)
+        self.tr_id         = tr_id
+        self.acting_cap_id = acting_cap_id
+        self.inner_view    = inner_view
+        self.content       = content
+        btn = ui.Button(label=label, style=discord.ButtonStyle.success)
+        btn.callback = self._dispatch
+        self.add_item(btn)
+
+    async def _dispatch(self, interaction: discord.Interaction):
+        uid = str(interaction.user.id)
+        if uid != self.acting_cap_id:
+            await interaction.response.send_message(
+                "⏳ Waiting for the other captain to pick.", ephemeral=True)
+            return
+        await interaction.response.send_message(self.content, view=self.inner_view, ephemeral=True)
+
 
 class SelectDefenderView(ui.View):
     def __init__(self, tr_id: str, captain_id: str, eligible: List[dict], side: str):
@@ -442,8 +508,6 @@ async def run_pairing_phase(bot, guild: discord.Guild, tr_id: str, phase: int):
     pairings = db_get_team_pairings(tr_id)
     thread   = guild.get_thread(int(tr["pairing_thread_id"])) if tr.get("pairing_thread_id") else None
     cap_a, cap_b = team_a["captain_id"], team_b["captain_id"]
-    mem_a = guild.get_member(int(cap_a))
-    mem_b = guild.get_member(int(cap_b))
     phase_count = FMT.phase_count(fmt)
 
     db_update_pairing_state(tr_id, {
@@ -453,30 +517,28 @@ async def run_pairing_phase(bot, guild: discord.Guild, tr_id: str, phase: int):
         "choice_a": None, "choice_b": None,
     })
     await _update_dashboard(bot, tr_id, guild)
-    if thread:
-        await _post_ritual_update(thread, f"🛡️ **Phase {phase}/{phase_count} — Both captains selecting Defender (in secret)...**")
-
     elig_a = _get_unpaired(ma_all, pairings, "a")
     elig_b = _get_unpaired(mb_all, pairings, "b")
 
-    if mem_a:
-        try:
-            await mem_a.send(
-                f"🛡️ **Phase {phase}/{phase_count}: Choose your Defender** ({team_a['team_name']}):",
-                view=SelectDefenderView(tr_id, cap_a, elig_a, "a"))
-        except Exception as e:
-            print(f"⚠️ DM cap_a: {e}")
-    if mem_b:
-        try:
-            await mem_b.send(
-                f"🛡️ **Phase {phase}/{phase_count}: Choose your Defender** ({team_b['team_name']}):",
-                view=SelectDefenderView(tr_id, cap_b, elig_b, "b"))
-        except Exception as e:
-            print(f"⚠️ DM cap_b: {e}")
+    action_msg = None
+    if thread:
+        action_msg = await thread.send(
+            f"🛡️ **Phase {phase}/{phase_count} — Both captains: select your Defender secretly.**\n"
+            "Only you will see your selection. Results revealed simultaneously.",
+            view=CaptainActionView(
+                tr_id, cap_a, cap_b,
+                view_a=SelectDefenderView(tr_id, cap_a, elig_a, "a"),
+                view_b=SelectDefenderView(tr_id, cap_b, elig_b, "b"),
+                label="🛡️ Select Defender",
+                content_a=f"Select your Defender ({team_a['team_name']}):",
+                content_b=f"Select your Defender ({team_b['team_name']}):",
+            )
+        )
 
     if not await _wait_for_both(bot, tr_id, "defender_a", "defender_b"):
-        if thread: await thread.send("⚠️ Defender selection timed out. TO intervention required.")
+        if action_msg: await action_msg.edit(content="⚠️ Defender selection timed out. TO intervention required.", view=None)
         return False
+
 
     state    = db_get_pairing_state(tr_id)
     def_a_id = state["defender_a"]
@@ -497,25 +559,24 @@ async def run_pairing_phase(bot, guild: discord.Guild, tr_id: str, phase: int):
     elig_att_b = [m for m in elig_b if m["player_id"] != def_b_id]
     cnt_a, cnt_b = min(2, len(elig_att_a)), min(2, len(elig_att_b))
 
-    scrum_note = "\n*(Your remaining player will go to the SCRUM if this is the last phase)*" if fmt == FMT.TEAMS_8 else ""
+    scrum_note = " *(remaining player goes to SCRUM)*" if fmt == FMT.TEAMS_8 else ""
 
-    if mem_a:
-        try:
-            await mem_a.send(
-                f"⚔️ **Phase {phase}/{phase_count}: Choose {cnt_a} Attacker(s):**{scrum_note}",
-                view=SelectAttackersView(tr_id, cap_a, elig_att_a, "a", cnt_a))
-        except Exception as e:
-            print(f"⚠️ DM cap_a: {e}")
-    if mem_b:
-        try:
-            await mem_b.send(
-                f"⚔️ **Phase {phase}/{phase_count}: Choose {cnt_b} Attacker(s):**{scrum_note}",
-                view=SelectAttackersView(tr_id, cap_b, elig_att_b, "b", cnt_b))
-        except Exception as e:
-            print(f"⚠️ DM cap_b: {e}")
+    action_msg = None
+    if thread:
+        action_msg = await thread.send(
+            f"⚔️ **Phase {phase}/{phase_count} — Both captains: select your Attacker(s) secretly.**{scrum_note}",
+            view=CaptainActionView(
+                tr_id, cap_a, cap_b,
+                view_a=SelectAttackersView(tr_id, cap_a, elig_att_a, "a", cnt_a),
+                view_b=SelectAttackersView(tr_id, cap_b, elig_att_b, "b", cnt_b),
+                label=f"⚔️ Select Attacker{'s' if max(cnt_a, cnt_b) > 1 else ''}",
+                content_a=f"Select {cnt_a} Attacker(s) ({team_a['team_name']}):",
+                content_b=f"Select {cnt_b} Attacker(s) ({team_b['team_name']}):",
+            )
+        )
 
     if not await _wait_for_both(bot, tr_id, "attackers_a", "attackers_b"):
-        if thread: await thread.send("⚠️ Attacker selection timed out.")
+        if action_msg: await action_msg.edit(content="⚠️ Attacker selection timed out.", view=None)
         return False
 
     state         = db_get_pairing_state(tr_id)
@@ -534,25 +595,22 @@ async def run_pairing_phase(bot, guild: discord.Guild, tr_id: str, phase: int):
     # ── Choices ───────────────────────────────────────────────────────────────
     db_update_pairing_state(tr_id, {"current_step": PS.AWAIT_CHOICE})
 
-    if mem_a:
-        try:
-            await mem_a.send(
-                f"🎯 **Phase {phase}/{phase_count}: Choose which attacker faces your defender "
-                f"({def_a.get('player_username','?')}):**",
-                view=ChooseAttackerView(tr_id, cap_a, "a", att_b_members))
-        except Exception as e:
-            print(f"⚠️ DM cap_a: {e}")
-    if mem_b:
-        try:
-            await mem_b.send(
-                f"🎯 **Phase {phase}/{phase_count}: Choose which attacker faces your defender "
-                f"({def_b.get('player_username','?')}):**",
-                view=ChooseAttackerView(tr_id, cap_b, "b", att_a_members))
-        except Exception as e:
-            print(f"⚠️ DM cap_b: {e}")
+    action_msg = None
+    if thread:
+        action_msg = await thread.send(
+            f"🎯 **Phase {phase}/{phase_count} — Both captains: choose which opponent Attacker faces your Defender.**",
+            view=CaptainActionView(
+                tr_id, cap_a, cap_b,
+                view_a=ChooseAttackerView(tr_id, cap_a, "a", att_b_members),
+                view_b=ChooseAttackerView(tr_id, cap_b, "b", att_a_members),
+                label="🎯 Choose Attacker",
+                content_a=f"Which attacker faces your defender **{def_a.get('player_username','?')}**?",
+                content_b=f"Which attacker faces your defender **{def_b.get('player_username','?')}**?",
+            )
+        )
 
     if not await _wait_for_both(bot, tr_id, "choice_a", "choice_b"):
-        if thread: await thread.send("⚠️ Choice selection timed out.")
+        if action_msg: await action_msg.edit(content="⚠️ Choice selection timed out.", view=None)
         return False
 
     state    = db_get_pairing_state(tr_id)
@@ -664,17 +722,19 @@ async def run_layout_mission_phase(bot, guild: discord.Guild, tr_id: str, slots:
                 "current_step": PS.AWAIT_LAYOUT_A if lp == "team_a" else PS.AWAIT_LAYOUT_B
             })
             await _update_dashboard(bot, tr_id, guild)
-            if thread:
-                await _post_ritual_update(thread, f"🗺️ **Slot {slot}: {layout_team_name}** choosing layout...")
 
-            layout_member = guild.get_member(int(layout_cap_id))
-            if layout_member:
-                try:
-                    await layout_member.send(
-                        f"🗺️ **Slot {slot}: Choose a layout:**",
-                        view=SelectLayoutView(tr_id, layout_cap_id, slot, available))
-                except Exception as e:
-                    print(f"⚠️ DM layout: {e}")
+            action_msg = None
+            if thread:
+                action_msg = await thread.send(
+                    f"🗺️ **Slot {slot}: {layout_team_name} — select a Layout.**",
+                    view=SingleCaptainActionView(
+                        tr_id, layout_cap_id,
+                        inner_view=SelectLayoutView(tr_id, layout_cap_id, slot, available),
+                        label="🗺️ Pick Layout",
+                        content=f"Choose a layout for Slot {slot}:",
+                    )
+                )
+
 
             # Poll for layout selection
             for _ in range(100):
@@ -699,15 +759,17 @@ async def run_layout_mission_phase(bot, guild: discord.Guild, tr_id: str, slots:
             await _post_ritual_update(thread,
                 f"🎯 **Slot {slot}{layout_str}: {mission_team_name}** choosing mission...")
 
-        mission_member = guild.get_member(int(mission_cap_id))
-        if mission_member:
-            try:
-                await mission_member.send(
-                    f"🎯 **Slot {slot}: Choose a mission{f' for Layout {layout_num}' if layout_num else ''}:**",
-                    view=SelectMissionView(tr_id, mission_cap_id, slot,
-                                          layout_num or 0, event_missions))
-            except Exception as e:
-                print(f"⚠️ DM mission: {e}")
+        action_msg = None
+            action_msg = await thread.send(
+                f"🎯 **Slot {slot}{layout_str}: {mission_team_name} — select a Mission.**",
+                view=SingleCaptainActionView(
+                    tr_id, mission_cap_id,
+                    inner_view=SelectMissionView(tr_id, mission_cap_id, slot,
+                                                 layout_num or 0, event_missions),
+                    label="🎯 Pick Mission",
+                    content=f"Choose a mission for Slot {slot}{layout_str}:",
+                )
+            )
 
         for _ in range(100):
             await asyncio.sleep(3)
@@ -998,40 +1060,67 @@ async def round_begin_ritual(interaction: discord.Interaction, event_id: str):
         await interaction.followup.send("❌ No pending team matchups found.", ephemeral=True)
         return
 
-    pr_thread = await ensure_pairing_room_thread(bot, event_id, interaction.guild, event["name"])
+    ch = bot.get_channel(EVENT_NOTICEBOARD_ID)
     started = 0
+    thread_mentions = []
 
     for tr in pending:
         team_a = db_get_team(tr["team_a_id"])
         team_b = db_get_team(tr["team_b_id"])
         db_create_pairing_state(tr["team_round_id"])
 
-        if pr_thread:
-            db_update_team_round(tr["team_round_id"], {"pairing_thread_id": str(pr_thread.id)})
-            view = RollOffView(
-                tr_id=tr["team_round_id"],
-                cap_a_id=team_a["captain_id"],
-                cap_b_id=team_b["captain_id"],
-                team_a_name=team_a["team_name"],
-                team_b_name=team_b["team_name"],
-                bot_ref=bot,
+        # Create a private per-matchup thread in #event-noticeboard
+        thread = None
+        if ch:
+            from threads import create_private_thread, _add_thread_members
+            thread = await create_private_thread(
+                ch,
+                f"🎲 R{rnd['round_number']} — {team_a['team_name']} vs {team_b['team_name']}"
             )
+        if thread:
+            # Add both teams' players + crew
+            player_ids = (
+                [m["player_id"] for m in db_get_team_members(team_a["team_id"])] +
+                [m["player_id"] for m in db_get_team_members(team_b["team_id"])]
+            )
+            await _add_thread_members(thread, interaction.guild, player_ids)
+            db_update_team_round(tr["team_round_id"], {"pairing_thread_id": str(thread.id)})
+
+            # Opening card
+            layout_str  = ", ".join(f"Layout {l}" for l in _get_event_layouts(event)) or "TBD"
+            mission_str = ", ".join(_get_event_missions(event)) or "TBD"
+            await thread.send(embed=discord.Embed(
+                title=f"⚔️  {team_a['team_name']}  vs  {team_b['team_name']}",
+                description=(
+                    f"**Round {rnd['round_number']}  ·  {event['name']}**\n"
+                    f"🗺️ Layouts: {layout_str}\n"
+                    f"🎯 Missions: {mission_str}\n\n"
+                    f"Captains: <@{team_a['captain_id']}> and <@{team_b['captain_id']}>\n"
+                    f"*Only players from these two teams and crew can see this thread.*"
+                ),
+                color=COLOUR_AMBER,
+            ))
+
             await _update_dashboard(bot, tr["team_round_id"], interaction.guild)
-            await pr_thread.send(
-                f"⚔️ **{team_a['team_name']}**  vs  **{team_b['team_name']}**\n"
-                f"Captains: <@{team_a['captain_id']}> and <@{team_b['captain_id']}> — roll to determine layout picker:",
-                view=view,
+            await thread.send(
+                f"🎲 **Captains: roll to decide who picks layouts first.**",
+                view=RollOffView(
+                    tr_id=tr["team_round_id"],
+                    cap_a_id=team_a["captain_id"],
+                    cap_b_id=team_b["captain_id"],
+                    team_a_name=team_a["team_name"],
+                    team_b_name=team_b["team_name"],
+                    bot_ref=bot,
+                ),
             )
+            thread_mentions.append(thread.mention)
         started += 1
 
-    reply = (
-        f"✅ Pairing ritual started for {started} matchup(s).\n"
-        f"Pairing Room: {pr_thread.mention if pr_thread else '#event-noticeboard'}"
-    )
+    threads_str = "  ".join(thread_mentions) if thread_mentions else "#event-noticeboard"
+    reply = f"✅ Pairing ritual started for {started} matchup(s).\nThreads: {threads_str}"
     if warnings:
         reply += "\n\n" + "\n".join(warnings)
     await interaction.followup.send(reply, ephemeral=True)
-
 
 # ── /roll ─────────────────────────────────────────────────────────────────────
 
