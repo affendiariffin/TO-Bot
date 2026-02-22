@@ -703,8 +703,10 @@ def build_team_standings_embed(event: dict, standings: List[dict], final: bool =
     """Team-format standings table: team_points → game_points → vp_diff."""
     medals = {1: "🥇", 2: "🥈", 3: "🥉"}
     fmt_label = event.get("format", "singles").replace("_", " ").title()
+    is_wtc = event.get("scoring_mode") == "wtc"
+    mode_tag = "WTC" if is_wtc else "NTL"
     title  = (f"🏆  Final Standings — {event['name']}" if final
-              else f"📊  Team Standings — {event['name']}  [{fmt_label}]")
+              else f"📊  Team Standings — {event['name']}  [{fmt_label} · {mode_tag}]")
     colour = COLOUR_GOLD if final else COLOUR_SLATE
 
     if not standings:
@@ -722,14 +724,22 @@ def build_team_standings_embed(event: dict, standings: List[dict], final: bool =
             f"{s.get('game_points',0):>4} {s.get('vp_diff',0):>+5}"
         )
     lines.append("```")
-    lines.append("*TP=Tournament Points  GP=Game Points  VPΔ=VP differential*")
+    if is_wtc:
+        lines.append(
+            "*TP=Tournament Pts  GP=WTC Game Pts (>85 Win · 75–85 Tie · <75 Loss)  VPΔ=VP diff*"
+        )
+    else:
+        lines.append("*TP=Tournament Points  GP=Game Points  VPΔ=VP differential*")
 
     embed = discord.Embed(title=title, description="\n".join(lines), color=colour)
     if not final:
         rounds = db_get_rounds(event["event_id"])
         done   = sum(1 for r in rounds if r["state"] == RndS.COMPLETE)
         total  = event.get("round_count", 3)
-        embed.set_footer(text=f"Round {done}/{total}  ·  Primary: Tournament Points  ·  Secondary: Game Points")
+        if is_wtc:
+            embed.set_footer(text=f"Round {done}/{total}  ·  WTC Scoring  ·  Primary: TP  ·  Tiebreaker: GP → VP diff")
+        else:
+            embed.set_footer(text=f"Round {done}/{total}  ·  Primary: Tournament Points  ·  Secondary: Game Points")
     else:
         embed.set_footer(text="Tournament complete")
     return embed
