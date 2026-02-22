@@ -31,9 +31,9 @@ def get_conn():
 
 
 def _parse_event_row(r) -> dict:
-    """Deserialise JSON list columns on an event row."""
+    """Deserialise JSON list columns on event rows."""
     d = dict(r)
-    for col in ("event_layouts", "event_missions"):
+    for col in ("event_layouts", "event_missions", "event_pairings"):
         raw = d.get(col)
         if isinstance(raw, str):
             try:
@@ -43,7 +43,6 @@ def _parse_event_row(r) -> dict:
         elif raw is None:
             d[col] = []
     return d
-
 
 def init_db():
     with get_conn() as conn:
@@ -70,7 +69,7 @@ def init_db():
                     created_at           TIMESTAMP NOT NULL DEFAULT NOW()
                 )
             """)
-            # Add columns if upgrading from earlier versions
+            # Add thread columns if upgrading from v2
             for col in ("submissions_thread_id", "lists_thread_id"):
                 cur.execute(f"""
                     ALTER TABLE tournament_events ADD COLUMN IF NOT EXISTS {col} TEXT
@@ -205,8 +204,14 @@ def init_db():
                 "captains_thread_id TEXT",
                 "pairing_room_thread_id TEXT",
                 "standings_msg_id TEXT",   # FIX: added missing column used by refresh_standings_card
-                "event_layouts TEXT",      # JSON array of layout numbers e.g. '["1","4","8"]'
-                "event_missions TEXT",     # JSON array of mission codes  e.g. '["A","C","M"]'
+                # round_count: 3 or 5 — set explicitly by TO at creation, stored here as the source of truth
+                "round_count INTEGER DEFAULT 3",
+                # singles/2v2: ordered list of {layout, mission} combos for all rounds of the event
+                # validated at creation — no duplicates, no illegal combos
+                "event_pairings TEXT",
+                # team formats: pool of layouts/missions captains pick from during each ritual
+                "event_layouts TEXT",
+                "event_missions TEXT",
             ):
                 cur.execute(f"ALTER TABLE tournament_events ADD COLUMN IF NOT EXISTS {col_def}")
 
@@ -382,11 +387,11 @@ def db_create_event(d: dict) -> str:
             cur.execute("""
                 INSERT INTO tournament_events
                     (event_id,name,state,points_limit,mission_code,terrain_layout,
-                     max_players,rounds_per_day,start_date,end_date,created_by)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                     max_players,round_count,rounds_per_day,start_date,end_date,created_by)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             """, (eid, d["name"], ES.ANNOUNCED, d["points_limit"], d["mission_code"],
-                  d.get("terrain_layout"), d["max_players"], d.get("rounds_per_day",3),
-                  d["start_date"], d["end_date"], d["created_by"]))
+                  d.get("terrain_layout"), d["max_players"], d.get("round_count", 3),
+                  d.get("rounds_per_day", 3), d["start_date"], d["end_date"], d["created_by"]))
             conn.commit()
     return eid
 
@@ -411,9 +416,8 @@ def db_get_all_events() -> List[dict]:
 
 def db_update_event(eid: str, updates: dict):
     if not updates: return
-    # Serialise list columns to JSON before writing
     serialised = dict(updates)
-    for col in ("event_layouts", "event_missions"):
+    for col in ("event_layouts", "event_missions", "event_pairings"):
         if col in serialised and isinstance(serialised[col], list):
             serialised[col] = _json.dumps(serialised[col])
     fields = ", ".join(f"{k}=%s" for k in serialised)
